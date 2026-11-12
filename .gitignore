@@ -120,3 +120,40 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 log/
 
 **logs
+# Local B300 environment
+.venv/
+local_setup/*.log
+local_setup/*.stdout
+
+.venv-qwen35/
+
+# Local tools, downloaded models, datasets and runtime artifacts
+/.tools/
+/models/
+/model/
+/datasets/
+*.safetensors
+*.bin
+*.pth
+*.onnx
+*.gguf
+*.index
+*.parquet
+*.arrow
+*.h5
+*.hdf5
+*.pid
+*.stdout
+*.out
+/ray_results/
+/tmp/
+/local_setup/cleanup.json
+/local_setup/*validation*.json
+/local_setup/versions.json
+
+# Credentials and machine-local settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key

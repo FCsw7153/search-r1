@@ -1,0 +1,20 @@
+tools:
+  - class_name: verl.tools.search_r1_tool.SearchR1Tool
+    config:
+      type: native
+      retrieval_service_url: ${oc.env:SEARCH_URL,http://127.0.0.1:8000/retrieve}
+      topk: 3
+      timeout: 30
+      max_concurrency: 8
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: Search the reference corpus for facts needed to answer the question.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+              description: A concise search query.
+          required: [query]
