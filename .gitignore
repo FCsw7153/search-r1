@@ -8,6 +8,8 @@
 **/playground
 **/wandb
 
+/pyrightconfig.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -17,12 +19,10 @@ tensorflow/my_graph/*
 .idea/
 # C extensions
 *.so
-data
-sft/output/*
-sft/data/*
 
 # Distribution / packaging
 .Python
+# env/
 build/
 develop-eggs/
 dist/
@@ -34,6 +34,7 @@ lib64/
 parts/
 sdist/
 var/
+tmp/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -58,6 +59,8 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+pytest.ini
+output.txt
 
 # Translations
 *.mo
@@ -66,10 +69,6 @@ coverage.xml
 # Django stuff:
 *.log
 local_settings.py
-
-image_outputs
-
-checkpoints
 
 # Flask stuff:
 instance/
@@ -93,10 +92,16 @@ target/
 # celery beat schedule file
 celerybeat-schedule
 
+# dotenv
+.env
 
 # virtualenv
 venv/
+.venv
+.venv-*
+.venvs/
 ENV/
+!**/workers/env/
 
 # Spyder project settings
 .spyderproject
@@ -110,50 +115,25 @@ ENV/
 # Mac
 .DS_Store
 
-# output logs
-tests/e2e/toy_examples/deepspeed/synchronous/output.txt
-
 # vim
 *.swp
 
-# log*
-log/
+# emacs
+*~
 
-**logs
-# Local B300 environment
-.venv/
-local_setup/*.log
-local_setup/*.stdout
-
-.venv-qwen35/
-
-# Local tools, downloaded models, datasets and runtime artifacts
-/.tools/
-/models/
-/model/
-/datasets/
-*.safetensors
-*.bin
-*.pth
-*.onnx
-*.gguf
-*.index
+# data
 *.parquet
-*.arrow
-*.h5
-*.hdf5
-*.pid
-*.stdout
-*.out
-/ray_results/
-/tmp/
-/local_setup/cleanup.json
-/local_setup/*validation*.json
-/local_setup/versions.json
 
-# Credentials and machine-local settings
-.env
-.env.*
-!.env.example
-*.pem
-*.key
+
+# local logs
+logs
+log
+outputs
+.history
+
+# Search-R1 server-local artifacts
+/data/
+/.venv/
+/.tools/
+/.cache/
+/checkpoints/

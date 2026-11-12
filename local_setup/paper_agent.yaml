@@ -1,2 +1,0 @@
-- name: paper_tool_agent
-  _target_: paper_agent.PaperToolAgent
