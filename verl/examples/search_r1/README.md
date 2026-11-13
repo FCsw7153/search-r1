@@ -80,17 +80,82 @@ EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grp
 ```
 
 `EXP` 是唯一的实验名（同时也是 trainer 的 experiment_name、实验目录和 checkpoint 目录）。
-`BG=1` 会 nohup 到后台，打印实验目录、log、metrics、PID 和 `tail -f` 命令。
+`GPUS=0,1,2,3` / `VAL=full` 是默认值：`GPUS` 决定 `CUDA_VISIBLE_DEVICES`，并按个数设置
+`trainer.n_gpus_per_node`；`VAL=sub` 换成 `test_sub.parquet`（分层抽样，验证更快）。
+`BG=1` 会 nohup 到后台，打印实验目录、log、metrics、PID、pid 文件和 `tail -f` 命令。
 不加 `BG=1` 则前台运行并同时 tee 到 log。
 
-每次训练都会写 `runs/<TS>.command.sh`（可重放）和 `runs/<TS>.hydra/`，
-并更新 `meta.json`（`status` 从 `running` 到 `finished` / `failed (exit N)`）。
+每次训练都会写 `runs/<TS>.command.sh`（可重放）、`runs/<TS>.hydra/` 和
+`runs/<TS>.pid`（仅 `BG=1`），并更新 `meta.json`（`status` 从 `running` 到
+`finished` / `failed (exit N)`，另外记录生效后的 `train_batch_size`、`rollout_n` 和
+`overrides`，dashboard 用它们算 samples seen）。
 额外的 Hydra override 直接作为参数追加，优先级最高：
 
 ```bash
 EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
     actor_rollout_ref.actor.optim.lr=5e-7
 ```
+
+## 一个节点并行跑两个实验（每个 2 卡）
+
+```bash
+# slot A：GPU0 上有检索服务，显存少 ~35GB
+EXP=exp-a GPUS=0,1 VAL=sub BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+# slot B
+EXP=exp-b GPUS=2,3 VAL=sub BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+```
+
+两个 job 各起一个本机 Ray 集群、各占 2 张卡，互不共享进程和资源：
+
+- `GPUS` 设置 `CUDA_VISIBLE_DEVICES`，Ray 的 raylet 由 driver 启动并继承该变量，
+  所以每个集群只看得到自己的 2 张卡；`trainer.n_gpus_per_node` 取 `GPUS` 的个数。
+- **Ray 的 `ray.init()` 会自动连已有集群**：无 `address` 时它先看 `RAY_ADDRESS`，再找
+  `<temp_dir>/ray_current_cluster`，找到就连上去（两个 job 共享 `/tmp/ray` 时，第二个 job
+  会静默变成第一个的第二个 driver，GPU/actor 名字/TransferQueue controller 全部串台）。
+  所以每个实验用独立的 `_temp_dir=/tmp/ray-<cksum(EXP_DIR)>`，并显式传 `address=local`
+  （崩溃残留的 `ray_current_cluster` 和外部 `RAY_ADDRESS` 都不会被连）。用 `/tmp` 下的短路径
+  而不是实验目录，是因为 Ray 会在 `<temp_dir>/session_*/sockets/` 下建 AF_UNIX socket：
+  实验目录在共享网络/FUSE 盘上时可能不支持 Unix socket、路径容易超过 107 字节上限，而且
+  Ray 启动也慢（之前在这块盘上超时过一次）。每个 job 的 Ray 会话/日志都在这个 `/tmp/ray-*`
+  目录里，`DRY_RUN=1` 和 `BG=1` 的输出会打印它。
+- **权重同步的 IPC socket 也要分开**：colocated 的 FSDP→vLLM 权重传输用
+  `/tmp/rl-colocate-zmq-{job_id}-replica-{r}-rank-{l}.sock`，而两个独立 Ray 集群的第一个
+  job 都叫 `01000000`，socket 名会撞。本仓库为此做了一处最小代码改动：socket 名优先读
+  `VERL_ZMQ_JOB_TOKEN` 环境变量（`vllm_rollout.py`、`vllm_async_server.py`、
+  `vllm_pd_replica.py`），launcher 把它设成 `<cksum(EXP_DIR)>-<launcher pid>`（每 job 唯一，
+  长度固定，避免长 EXP 把 socket 路径顶到 108 字节上限）。没有这个改动时并行 job 的权重同步
+  会互相踩（可能连到另一个 job 的 engine）。
+- 端口方面没有会硬失败的固定端口：Ray 的 GCS / raylet / object manager / metrics 端口都是 0
+  （随机）。dashboard 关掉后即使还有进程碰 8265，Ray 的 dashboard 端口逻辑会自动换 8266+
+  （不致命）；dashboard agent 的固定端口 52365 第二个 job 绑不上时异常会被吞掉，只是降级。
+  vLLM 的 HTTP 是 `port=0`，vLLM master/DP 和 torch 分布式 master port 都是现找空闲端口。
+  TransferQueue（外部包）的 controller/storage 端口也是动态分配，controller 是各自集群里的
+  named actor；只有显式选 Mooncake/Yuanrong 后端时才有固定端口，别用它们。
+- `_temp_dir` 的副作用：verl 有几处硬编码 `/tmp/ray/session_latest`
+  （nsight profiler、Prometheus 配置、metrics service discovery）。我们不用这些功能；以后要用
+  profiler/metrics 时要记得这条。
+- `/dev/shm`：两个 Ray 集群各建自己的 object store，但共享同一个 `/dev/shm` 容量；verl 的
+  数据走 TransferQueue，object store 用量很小。不要给两个 job 同时开
+  `use_shm=True`（`/dev/shm/verl-cache/<md5>` 是共享路径）。
+- 两个 Ray 集群各自都会看到节点全部 CPU（`ray.init` 的 `num_cpus` 默认全量），CPU 是超卖的；
+  如果 agent loop / tokenizer 抢 CPU 明显，给每个 job 加 `+ray_kwargs.ray_init.num_cpus=<N>`。
+- GPU0 还要跑检索服务（~35GB），所以 `GPUS=0,1` 的 job 显存更紧；`gpu_memory_utilization=0.6`
+  保持不变（B300 268GB 下单卡预算见 `ablations.md` 的显存估算）。
+- 第一次并行时在服务器上确认一下：`nvidia-smi` 看两个 python 各占 2 卡；
+  两个日志里不应该出现 Ray 的 "Connecting to existing Ray cluster"；`ray --version` 应是
+  2.55.x（GCS 随机端口的依据）；`ls /tmp/rl-colocate-zmq-*.sock` 应该是两个不同的名字。
+
+**只停一个 job**：`BG=1` 的进程组 leader pid 写在
+`experiments/<EXP>/runs/<TS>.pid`（`BG=1` 用 `setsid` 启动，python 和它的 Ray 进程都在这个
+进程组里）：
+
+```bash
+kill -- -$(cat experiments/exp-a/runs/<TS>.pid)
+```
+
+不要用 `ray stop --force`：它按节点清理 Ray 进程，不区分是哪个 job 的，会把同节点另一个
+job 的 Ray 一起杀掉；而这里的会话目录又在实验目录下、不在 `/tmp/ray`，行为更不可控。
+只停一个 job 一律用进程组。
 
 ## 续训
 
@@ -118,6 +183,8 @@ bash verl/examples/search_r1/pack_metrics.sh all             # 所有实验打�
   KL 从 6e-4 涨到 ~0.05，训练在 60 步左右 collapse。本 recipe 固定为 `False`，并把
   `ppo_max_token_len_per_gpu` 降到 12288（不开 rmpad 时 24576 峰值约 219GB）。
 - **不要复用已有 EXP**：第二次训练会被拒绝；要接着跑就加 `RESUME=1`，否则换一个 `EXP`。
+- **同时跑两个实验时不要用 `ray stop --force`**：它会连带杀掉同节点另一个 job 的 Ray；
+  用 `experiments/<EXP>/runs/<TS>.pid` 杀本 job 的进程组（见上一节）。
 - **不要让 `uv run` / `uv sync` 动 `.venv`**：它们会按 `uv.lock` 重建环境，把不在 lock 里的
   `faiss-gpu` 删掉。装包用 `uv pip install --python .venv/bin/python ...`。
 - **`.venv-mig` 只给 MIG 切片用**，普通 4×B300 训练不要用它。

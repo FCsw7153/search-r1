@@ -155,8 +155,10 @@ class vLLMHttpServer:
         # Without this, two concurrent verl jobs on the same node both bind
         # the same /tmp/rl-colocate-zmq-replica-0-rank-0.sock and one fails
         # with EADDRINUSE; a stale socket from a crashed run trips the same
-        # error on restart.
-        os.environ["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
+        # error on restart. Two independent clusters both name their first job
+        # 01000000, so VERL_ZMQ_JOB_TOKEN (set per experiment by the launcher)
+        # takes precedence when present.
+        os.environ["VERL_RAY_JOB_ID"] = os.environ.get("VERL_ZMQ_JOB_TOKEN") or ray.get_runtime_context().get_job_id()
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)

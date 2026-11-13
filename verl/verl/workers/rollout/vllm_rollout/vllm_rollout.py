@@ -136,8 +136,11 @@ class ServerAdapter(BaseRollout):
         # multiple replicas share a node, and the Ray job id so two independent
         # verl jobs on the same host (or a new run after a crashed one with a
         # stale socket file) cannot collide on the shared /tmp namespace.
+        # Two independent Ray clusters both name their first job 01000000, so the
+        # job id alone is not unique across clusters: VERL_ZMQ_JOB_TOKEN (set by the
+        # launcher per experiment) takes precedence when present.
         local_rank = self.rollout_rank % local_world_size
-        job_id = ray.get_runtime_context().get_job_id()
+        job_id = os.environ.get("VERL_ZMQ_JOB_TOKEN") or ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
         self.use_shm = not is_support_ipc()

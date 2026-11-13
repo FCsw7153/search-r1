@@ -5,7 +5,7 @@
 # Requires the venv (source "$SEARCH_R1_HOME/.venv/bin/activate"); never use `uv run`,
 # which would replace the environment's faiss-gpu without it being in uv.lock.
 #
-#   EXP=<name> [BG=1] [RESUME=1] bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+#   EXP=<name> [BG=1] [RESUME=1] [GPUS=0,1] [VAL=sub|full] bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 #   SMOKE=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 #   [DRY_RUN=1] ...            print resolved paths and the command, create nothing
 
@@ -17,13 +17,32 @@ SCRIPT_FILE=${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")
 CODE_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 SEARCH_R1_HOME=${SEARCH_R1_HOME:-$(cd "${CODE_DIR}/.." && pwd)}
 
+# GPUS picks the devices for this job (e.g. 0,1 or 2,3 for two jobs on one node);
+# trainer.n_gpus_per_node is derived from the count.
+GPUS=${GPUS:-0,1,2,3}
+if [[ ! "${GPUS}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "GPUS 必须是逗号分隔的设备号，例如 0,1: ${GPUS}" >&2
+    exit 1
+fi
+GPU_COUNT=$(awk -F, '{print NF}' <<< "${GPUS}")
+# VAL=full uses the full 7-dataset test.parquet, VAL=sub the stratified test_sub.parquet.
+VAL=${VAL:-full}
+case "${VAL}" in
+    full) TEST_FILE=${TEST_FILE:-${SEARCH_R1_HOME}/data/search_r1/test.parquet} ;;
+    sub) TEST_FILE=${TEST_FILE:-${SEARCH_R1_HOME}/data/search_r1/test_sub.parquet} ;;
+    *)
+        echo "VAL 只能是 full 或 sub: ${VAL}" >&2
+        exit 1
+        ;;
+esac
+
 MODEL_PATH=${MODEL_PATH:-${SEARCH_R1_HOME}/data/models/Qwen3.5-2B}
 TRAIN_FILE=${TRAIN_FILE:-${SEARCH_R1_HOME}/data/search_r1/train.parquet}
-TEST_FILE=${TEST_FILE:-${SEARCH_R1_HOME}/data/search_r1/test.parquet}
 TOOL_CONFIG=${TOOL_CONFIG:-${CODE_DIR}/examples/search_r1/config/search_tool_config.yaml}
-NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-4}
 VERL_PYTHON=${VERL_PYTHON:-python3}
-export SEARCH_R1_HOME MODEL_PATH TRAIN_FILE TEST_FILE TOOL_CONFIG NDEVICES_PER_NODE VERL_PYTHON
+export SEARCH_R1_HOME MODEL_PATH TRAIN_FILE TEST_FILE TOOL_CONFIG VERL_PYTHON
+# Ray workers inherit this, so each job only sees its own GPUs.
+export CUDA_VISIBLE_DEVICES="${GPUS}"
 
 SMOKE=${SMOKE:-0}
 RESUME=${RESUME:-0}
@@ -74,6 +93,7 @@ LOG=${EXP_DIR}/runs/${TS}.log
 METRICS=${EXP_DIR}/runs/${TS}.metrics.jsonl
 HYDRA_DIR=${EXP_DIR}/runs/${TS}.hydra
 COMMAND_FILE=${EXP_DIR}/runs/${TS}.command.sh
+PID_FILE=${EXP_DIR}/runs/${TS}.pid
 META_FILE=${EXP_DIR}/meta.json
 
 # SMOKE forces a 2-step run with no validation and no checkpoints.
@@ -174,7 +194,7 @@ TRAINER=(
     trainer.project_name=search_r1
     trainer.experiment_name="${EXP}"
     trainer.default_local_dir="${CKPT_DIR}"
-    trainer.n_gpus_per_node=${NDEVICES_PER_NODE}
+    trainer.n_gpus_per_node=${GPU_COUNT}
     trainer.nnodes=1
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS}
     trainer.total_epochs=15
@@ -187,8 +207,22 @@ TRAINER=(
     trainer.log_val_generations=10
 )
 
+# Two jobs on one node each start their own local Ray cluster. A fresh _temp_dir means
+# ray.init() finds no other cluster to attach to, and address=local also ignores a stale
+# ray_current_cluster left by a crashed run. Keep it on local disk with a short name: Ray
+# creates AF_UNIX sockets under <temp_dir>/session_*/sockets (107-byte path limit, and
+# network/FUSE mounts often do not support Unix sockets). VERL_ZMQ_JOB_TOKEN keeps the
+# colocated weight-sync IPC socket unique: two independent clusters both name their first
+# job 01000000, and the token also keeps the socket path short.
+RAY_TMP_SHORT=$(printf '%s' "${EXP_DIR}" | cksum | cut -d' ' -f1)
+RAY_TEMP_DIR=/tmp/ray-${RAY_TMP_SHORT}
+ZMQ_TOKEN="${RAY_TMP_SHORT}-$$"
+export VERL_ZMQ_JOB_TOKEN="${ZMQ_TOKEN}"
 RAY=(
     +ray_kwargs.ray_init.include_dashboard=False
+    +ray_kwargs.ray_init._temp_dir="${RAY_TEMP_DIR}"
+    +ray_kwargs.ray_init.address=local
+    +ray_kwargs.ray_init.runtime_env.env_vars.VERL_ZMQ_JOB_TOKEN="${ZMQ_TOKEN}"
 )
 
 HYDRA=(
@@ -206,6 +240,20 @@ OVERRIDES=(
     "${HYDRA[@]}"
     "$@"
 )
+
+# Effective values after overrides (the last assignment wins), recorded in meta.json so
+# the dashboard can compute samples seen (train_batch_size * rollout_n per step).
+last_override() {
+    local key=$1 item value=""
+    for item in "${OVERRIDES[@]}"; do
+        if [[ "${item}" == "${key}="* ]]; then
+            value=${item#*=}
+        fi
+    done
+    printf '%s' "${value}"
+}
+TRAIN_BATCH_SIZE=$(last_override data.train_batch_size)
+ROLLOUT_N=$(last_override actor_rollout_ref.rollout.n)
 
 ########################### derived ###########################
 RAY_agent_register_timeout_ms=${RAY_agent_register_timeout_ms:-120000}
@@ -232,12 +280,22 @@ print_command() {
 if [ "${DRY_RUN}" = 1 ]; then
     echo "SEARCH_R1_HOME=${SEARCH_R1_HOME}"
     echo "EXP=${EXP}"
+    echo "GPUS=${GPUS}"
+    echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    echo "GPU_COUNT=${GPU_COUNT}"
+    echo "RAY_TEMP_DIR=${RAY_TEMP_DIR}"
+    echo "ZMQ_TOKEN=${ZMQ_TOKEN}"
+    echo "VAL=${VAL}"
+    echo "TEST_FILE=${TEST_FILE}"
+    echo "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}"
+    echo "ROLLOUT_N=${ROLLOUT_N}"
     echo "EXP_DIR=${EXP_DIR}"
     echo "CKPT_DIR=${CKPT_DIR}"
     echo "LOG=${LOG}"
     echo "METRICS=${METRICS}"
     echo "HYDRA_DIR=${HYDRA_DIR}"
     echo "COMMAND_FILE=${COMMAND_FILE}"
+    echo "PID_FILE=${PID_FILE}"
     echo "META_FILE=${META_FILE}"
     echo "RESUME_MODE=${RESUME_MODE}"
     echo "---"
@@ -249,14 +307,20 @@ fi
 mkdir -p "${EXP_DIR}/runs"
 
 if [ "${BG}" = 1 ]; then
+    # setsid makes the child a process-group leader, so the pid file stops this job
+    # (python + its local Ray cluster) without touching the other job on the node.
     TS="${TS}" BG=0 BG_CHILD=1 EXP="${EXP}" SMOKE="${SMOKE}" RESUME="${RESUME}" \
-        nohup bash "${SCRIPT_FILE}" "$@" >> "${LOG}" 2>&1 &
+        GPUS="${GPUS}" VAL="${VAL}" \
+        setsid nohup bash "${SCRIPT_FILE}" "$@" >> "${LOG}" 2>&1 &
     pid=$!
+    echo "${pid}" > "${PID_FILE}"
     echo "EXP dir : ${EXP_DIR}"
+    echo "ray tmp : ${RAY_TEMP_DIR}    # Ray session/logs live here (local disk)"
     echo "log     : ${LOG}"
     echo "metrics : ${METRICS}"
-    echo "pid     : ${pid}"
+    echo "pid     : ${pid} (${PID_FILE})"
     echo "tail -f ${LOG}"
+    echo "stop    : kill -- -$(cat "${PID_FILE}")    # 只杀本实验的进程组，别用 ray stop --force"
     exit 0
 fi
 
@@ -266,10 +330,14 @@ write_command() {
         printf '# Generated by %s at %s\n' "${SCRIPT_FILE}" "${TS}"
         printf 'cd %q\n' "${CODE_DIR}"
         printf 'export SEARCH_R1_HOME=%q\n' "${SEARCH_R1_HOME}"
+        printf 'export CUDA_VISIBLE_DEVICES=%q\n' "${CUDA_VISIBLE_DEVICES}"
+        printf 'export GPUS=%q\n' "${GPUS}"
+        printf 'export VAL=%q\n' "${VAL}"
         printf 'export EXP=%q\n' "${EXP}"
         printf 'export SMOKE=%q\n' "${SMOKE}"
         printf 'export RESUME=%q\n' "${RESUME}"
         printf 'export VERL_FILE_LOGGER_PATH=%q\n' "${METRICS}"
+        printf 'export VERL_ZMQ_JOB_TOKEN=%q\n' "${ZMQ_TOKEN}"
         printf 'export RAY_agent_register_timeout_ms=%q\n' "${RAY_agent_register_timeout_ms}"
         printf '\n'
         printf '%s -m verl.trainer.main_ppo' "${VERL_PYTHON}"
@@ -296,6 +364,8 @@ update_meta() {
     META_RESUME="${RESUME_MODE}" \
     META_LOG="${LOG}" \
     META_METRICS="${METRICS}" \
+    META_TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}" \
+    META_ROLLOUT_N="${ROLLOUT_N}" \
     python3 - "$@" <<'PY'
 import datetime
 import json
@@ -316,6 +386,8 @@ meta["git_commit"] = os.environ["META_GIT_COMMIT"]
 meta["git_dirty"] = os.environ["META_GIT_DIRTY"] == "1"
 meta["host"] = os.environ["META_HOST"]
 meta["model_path"] = os.environ["META_MODEL_PATH"]
+meta["train_batch_size"] = int(os.environ["META_TRAIN_BATCH_SIZE"])
+meta["rollout_n"] = int(os.environ["META_ROLLOUT_N"])
 meta["overrides"] = sys.argv[1:]
 meta.setdefault("notes", "")
 
@@ -353,6 +425,8 @@ write_command
 update_meta running ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}
 
 if [ "${BG_CHILD:-0}" = 1 ]; then
+    # setsid makes this process the group leader; the pid file stops the whole job.
+    echo "$$" > "${PID_FILE}"
     # Detached child: the BG parent already redirects stdout/stderr to $LOG.
     "${VERL_PYTHON}" -m verl.trainer.main_ppo "${OVERRIDES[@]}"
 else
