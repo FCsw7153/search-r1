@@ -2,13 +2,13 @@
 # Pack the small metadata of an experiment (meta/metrics/command/hydra configs) into
 # $SEARCH_R1_HOME/experiments/_export/<name>_<TS>.tar.gz. Checkpoints and *.log are excluded.
 #
-#   bash examples/search_r1/pack_metrics.sh <EXP | path under experiments/> | all
+#   bash verl/examples/search_r1/pack_metrics.sh <EXP | path under experiments/> | all
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
-SEARCH_R1_HOME=${SEARCH_R1_HOME:-$(cd "${REPO_ROOT}/.." && pwd)}
+CODE_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
+SEARCH_R1_HOME=${SEARCH_R1_HOME:-$(cd "${CODE_DIR}/.." && pwd)}
 EXP_ROOT=${SEARCH_R1_HOME}/experiments
 TS=$(date +%Y%m%d_%H%M%S)
 target=${1:?usage: bash pack_metrics.sh <EXP|path under experiments/|all>}

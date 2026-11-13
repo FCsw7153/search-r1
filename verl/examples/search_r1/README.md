@@ -5,12 +5,12 @@ Search-R1 风格的 GRPO 训练：本地 E5 + FAISS 维基检索、verl 内置�
 
 ## 目录布局
 
-代码和 workspace 分开：本仓库是 `$SEARCH_R1_HOME/verl`，数据和实验都在 `$SEARCH_R1_HOME` 下，
-仓库本身不是数据目录。
+工作区根目录（`$SEARCH_R1_HOME`，也就是 git 仓库根）只跟踪 `verl/`；数据、实验、日志和
+虚拟环境都在同一层，但不进 git。
 
 ```
-$SEARCH_R1_HOME/
-├── verl/                        # 本仓库（git clone）
+$SEARCH_R1_HOME/                 # 工作区根 = git 仓库根
+├── verl/                        # 代码（verl@3255f6b1 + Search-R1 示例，Python 包在 verl/verl/）
 ├── .venv/  .venv-mig/  .tools/  .cache/
 ├── data/
 │   ├── nq_hotpotqa_train/       # 原始 Search-R1 parquet
@@ -24,9 +24,9 @@ $SEARCH_R1_HOME/
 └── logs/retriever.log
 ```
 
-`SEARCH_R1_HOME` 默认是仓库根目录的上一级（脚本在 `verl/examples/search_r1/`，向上三级）。
-所有路径都可以用环境变量覆盖（`SEARCH_R1_HOME`、`MODEL_PATH`、`TRAIN_FILE`、`TEST_FILE`、
-`TOOL_CONFIG`）。
+`SEARCH_R1_HOME` 默认是代码目录（`verl/`）的上一级，也就是工作区/git 仓库根
+（脚本在 `verl/examples/search_r1/`，向上三级）。所有路径都可以用环境变量覆盖
+（`SEARCH_R1_HOME`、`MODEL_PATH`、`TRAIN_FILE`、`TEST_FILE`、`TOOL_CONFIG`）。
 
 ## 一次性准备
 
@@ -40,7 +40,7 @@ uv pip install --python .venv/bin/python -e verl --no-deps
 ## 预处理
 
 ```bash
-python3 examples/data_preprocess/search_r1.py \
+python3 verl/examples/data_preprocess/search_r1.py \
     --input_dir "$SEARCH_R1_HOME/data/nq_hotpotqa_train" \
     --local_save_dir "$SEARCH_R1_HOME/data/search_r1" \
     --val_samples_per_source 200
@@ -51,7 +51,7 @@ python3 examples/data_preprocess/search_r1.py \
 ## 启动检索服务
 
 ```bash
-bash examples/search_r1/start_retriever.sh
+bash verl/examples/search_r1/start_retriever.sh
 ```
 
 日志在 `$SEARCH_R1_HOME/logs/retriever.log`，脚本会打印 PID 和 curl 自检命令。
@@ -60,20 +60,20 @@ GPU 用 `RETRIEVER_GPU=1` 指定（默认 0）。
 ## 冒烟训练
 
 ```bash
-SMOKE=1 bash examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+SMOKE=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 ```
 
 跑 2 步，不做验证、不存 checkpoint，结果在 `experiments/smoke/<TS>-smoke/`。
 先 `DRY_RUN=1` 看看解析出来的路径和完整命令：
 
 ```bash
-EXP=demo DRY_RUN=1 bash examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+EXP=demo DRY_RUN=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 ```
 
 ## 正式训练
 
 ```bash
-EXP=search-r1-001 BG=1 bash examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 ```
 
 `EXP` 是唯一的实验名（同时也是 trainer 的 experiment_name、实验目录和 checkpoint 目录）。
@@ -85,14 +85,14 @@ EXP=search-r1-001 BG=1 bash examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 额外的 Hydra override 直接作为参数追加，优先级最高：
 
 ```bash
-EXP=search-r1-001 BG=1 bash examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
+EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
     actor_rollout_ref.actor.optim.lr=5e-7
 ```
 
 ## 续训
 
 ```bash
-EXP=search-r1-001 RESUME=1 BG=1 bash examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+EXP=search-r1-001 RESUME=1 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 ```
 
 `RESUME=1` 要求实验目录已存在，并设置 `trainer.resume_mode=auto`。
@@ -101,8 +101,8 @@ EXP=search-r1-001 RESUME=1 BG=1 bash examples/search_r1/run_qwen3_5_2b_search_r1
 ## 导出 metrics
 
 ```bash
-bash examples/search_r1/pack_metrics.sh search-r1-001   # 或 smoke/<TS>-smoke
-bash examples/search_r1/pack_metrics.sh all             # 所有实验打成一个包
+bash verl/examples/search_r1/pack_metrics.sh search-r1-001   # 或 smoke/<TS>-smoke
+bash verl/examples/search_r1/pack_metrics.sh all             # 所有实验打成一个包
 ```
 
 生成 `experiments/_export/<name>_<TS>.tar.gz`，只含 `meta.json`、`runs/*.metrics.jsonl`、

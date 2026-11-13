@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Start the local E5 + FAISS retrieval server in the background.
 # Output is appended to $SEARCH_R1_HOME/logs/retriever.log.
-
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
-SEARCH_R1_HOME=${SEARCH_R1_HOME:-$(cd "${REPO_ROOT}/.." && pwd)}
+CODE_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
+SEARCH_R1_HOME=${SEARCH_R1_HOME:-$(cd "${CODE_DIR}/.." && pwd)}
 DATA_DIR=${SEARCH_R1_HOME}/data
 LOG=${SEARCH_R1_HOME}/logs/retriever.log
 mkdir -p "${SEARCH_R1_HOME}/logs"
