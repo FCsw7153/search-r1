@@ -34,10 +34,17 @@ if [ "${target}" = all ]; then
         exit 1
     fi
     for dir in "${EXP_ROOT}"/*/; do
+        [ -d "${dir}" ] || continue
         rel=$(basename "${dir}")
         [ "${rel}" = "_export" ] && continue
+        [ "${rel}" = "smoke" ] && continue
         find_in "${rel}"
     done > "${list}"
+    # smoke experiments live one level deeper: experiments/smoke/<TS>-<EXP>/
+    for dir in "${EXP_ROOT}/smoke"/*/; do
+        [ -d "${dir}" ] || continue
+        find_in "smoke/$(basename "${dir}")"
+    done >> "${list}"
 else
     if [ -d "${EXP_ROOT}/${target}" ]; then
         dir=$(cd "${EXP_ROOT}/${target}" && pwd)

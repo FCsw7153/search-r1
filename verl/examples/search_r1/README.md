@@ -32,10 +32,12 @@ $SEARCH_R1_HOME/                 # 工作区根 = git 仓库根
 
 ```bash
 cd "$SEARCH_R1_HOME"
-uv pip install --python .venv/bin/python -e verl --no-deps
+source "$SEARCH_R1_HOME/.venv/bin/activate"
+"$SEARCH_R1_HOME/.tools/uv" pip install --python .venv/bin/python -e verl --no-deps
 ```
 
-用 venv 的 Python 安装，不要用 `uv run` / `uv sync`（见文末的坑）。
+`uv` 不在服务器的 PATH 里，用 `.tools/uv`；先激活 `.venv`，脚本里的 `python3` 都来自它
+（包括 `start_retriever.sh`）。不要用 `uv run` / `uv sync`（见文末的坑）。
 
 ## 预处理
 
@@ -47,6 +49,7 @@ python3 verl/examples/data_preprocess/search_r1.py \
 ```
 
 会写出 `train.parquet`、`test.parquet`，以及分层抽样的 `test_sub.parquet`（每源 200 条）。
+服务器上 `data/search_r1/` 已经生成好了，这一步只需要做一次。
 
 ## 启动检索服务
 

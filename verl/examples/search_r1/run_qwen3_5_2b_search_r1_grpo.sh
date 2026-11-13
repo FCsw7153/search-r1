@@ -9,7 +9,7 @@
 #   SMOKE=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 #   [DRY_RUN=1] ...            print resolved paths and the command, create nothing
 
-set -xeuo pipefail
+set -euo pipefail
 
 ########################### workspace ###########################
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
