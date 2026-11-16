@@ -5,9 +5,14 @@
 # Requires the venv (source "$SEARCH_R1_HOME/.venv/bin/activate"); never use `uv run`,
 # which would replace the environment's faiss-gpu without it being in uv.lock.
 #
-#   EXP=<name> [BG=1] [RESUME=1] [GPUS=0,1] [VAL=sub|full] bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+#   EXP=<name> [BG=1] [RESUME=1] [GPUS=0,1] [VAL=sub|full] [CKPT_ROOT=<dir>] [LOCAL_ROOT=<dir>] \
+#       bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 #   SMOKE=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 #   [DRY_RUN=1] ...            print resolved paths and the command, create nothing
+#
+# CKPT_ROOT（默认空 = 旧行为）把 checkpoint 写到本地盘（见 README）；LOCAL_ROOT 里有
+# stage_local.sh 准备好的 .venv 时，未显式设置 VERL_PYTHON 就用它（Ray worker 继承
+# sys.executable，所以整个集群都走本地 venv）。
 
 set -euo pipefail
 
@@ -39,8 +44,23 @@ esac
 MODEL_PATH=${MODEL_PATH:-${SEARCH_R1_HOME}/data/models/Qwen3.5-2B}
 TRAIN_FILE=${TRAIN_FILE:-${SEARCH_R1_HOME}/data/search_r1/train.parquet}
 TOOL_CONFIG=${TOOL_CONFIG:-${CODE_DIR}/examples/search_r1/config/search_tool_config.yaml}
+# 本地盘（容器 overlay，pod 重建即清空）根目录；stage_local.sh 往这里放 venv 和检索数据。
+# 默认 /home/work/search_r1_local（不在慢速的 spfs 工作区里）；设成空字符串可禁用。
+LOCAL_ROOT=${LOCAL_ROOT-/home/work/search_r1_local}
+# 为空 = checkpoint 仍在 $EXP_DIR/checkpoints（旧行为）；设置后放本地盘并在实验目录留符号链接。
+CKPT_ROOT=${CKPT_ROOT:-}
+# VERL_PYTHON 显式设置时优先；否则有 $LOCAL_ROOT/.venv 就用它的 python。
+VERL_PYTHON_SET=${VERL_PYTHON:+1}
 VERL_PYTHON=${VERL_PYTHON:-python3}
-export SEARCH_R1_HOME MODEL_PATH TRAIN_FILE TEST_FILE TOOL_CONFIG VERL_PYTHON
+if [ -z "${VERL_PYTHON_SET}" ] && [ -n "${LOCAL_ROOT}" ] && [ -x "${LOCAL_ROOT}/.venv/bin/python" ]; then
+    VERL_PYTHON=${LOCAL_ROOT}/.venv/bin/python
+fi
+if command -v "${VERL_PYTHON}" >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v "${VERL_PYTHON}")
+else
+    PYTHON_BIN=${VERL_PYTHON}
+fi
+export SEARCH_R1_HOME MODEL_PATH TRAIN_FILE TEST_FILE TOOL_CONFIG VERL_PYTHON LOCAL_ROOT CKPT_ROOT
 # Ray workers inherit this, so each job only sees its own GPUs.
 export CUDA_VISIBLE_DEVICES="${GPUS}"
 
@@ -88,9 +108,26 @@ if [[ ! "${EXP}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     exit 1
 fi
 
-CKPT_DIR=${EXP_DIR}/checkpoints
-LOG=${EXP_DIR}/runs/${TS}.log
-METRICS=${EXP_DIR}/runs/${TS}.metrics.jsonl
+# 实验目录相对 experiments/ 的路径（EXP 本身，或 smoke/<TS>-smoke）；
+# CKPT_ROOT 下用同样的相对路径，两个实验的 checkpoint 不会互相覆盖。
+EXP_REL=${EXP_DIR#"${SEARCH_R1_HOME}"/experiments/}
+if [ "${EXP_REL}" = "${EXP_DIR}" ]; then
+    echo "内部错误：EXP_DIR 不在 ${SEARCH_R1_HOME}/experiments/ 下: ${EXP_DIR}" >&2
+    exit 1
+fi
+CKPT_LINK=${EXP_DIR}/checkpoints
+if [ -n "${CKPT_ROOT}" ]; then
+    CKPT_DIR=${CKPT_ROOT}/${EXP_REL}
+    CKPT_LOCAL=1
+else
+    CKPT_DIR=${CKPT_LINK}
+    CKPT_LOCAL=0
+fi
+CKPT_REAL=${CKPT_DIR}  # setup_ckpt_dir 里解析成物理路径
+LOG_REL=runs/${TS}.log
+METRICS_REL=runs/${TS}.metrics.jsonl
+LOG=${EXP_DIR}/${LOG_REL}
+METRICS=${EXP_DIR}/${METRICS_REL}
 HYDRA_DIR=${EXP_DIR}/runs/${TS}.hydra
 COMMAND_FILE=${EXP_DIR}/runs/${TS}.command.sh
 PID_FILE=${EXP_DIR}/runs/${TS}.pid
@@ -290,7 +327,14 @@ if [ "${DRY_RUN}" = 1 ]; then
     echo "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}"
     echo "ROLLOUT_N=${ROLLOUT_N}"
     echo "EXP_DIR=${EXP_DIR}"
+    echo "CKPT_ROOT=${CKPT_ROOT}"
+    echo "LOCAL_ROOT=${LOCAL_ROOT}"
     echo "CKPT_DIR=${CKPT_DIR}"
+    echo "CKPT_LINK=${CKPT_LINK}"
+    echo "CKPT_LOCAL=${CKPT_LOCAL}"
+    echo "CKPT_REAL=${CKPT_REAL}"
+    echo "VERL_PYTHON=${VERL_PYTHON}"
+    echo "PYTHON_BIN=${PYTHON_BIN}"
     echo "LOG=${LOG}"
     echo "METRICS=${METRICS}"
     echo "HYDRA_DIR=${HYDRA_DIR}"
@@ -306,6 +350,38 @@ fi
 ########################### launch ###########################
 mkdir -p "${EXP_DIR}/runs"
 
+# CKPT_ROOT 设置时：实验目录下留一个 checkpoints -> 本地盘目录 的符号链接，
+# RESUME 和人肉找 checkpoint 都走这个固定路径。旧符号链接直接替换；真实目录只有在
+# 空的情况下才替换，非空目录拒绝（避免把已有 checkpoint 藏起来）。
+setup_ckpt_dir() {
+    if [ -z "${CKPT_ROOT}" ]; then
+        mkdir -p "${CKPT_DIR}"
+        CKPT_REAL=$(cd "${CKPT_DIR}" && pwd -P)
+        return 0
+    fi
+    mkdir -p "${CKPT_DIR}"
+    if [ -L "${CKPT_LINK}" ]; then
+        rm -f "${CKPT_LINK}"
+    elif [ -e "${CKPT_LINK}" ]; then
+        if [ -d "${CKPT_LINK}" ] && [ -z "$(ls -A "${CKPT_LINK}" 2>/dev/null)" ]; then
+            rmdir "${CKPT_LINK}"
+        else
+            echo "拒绝：${CKPT_LINK} 已存在，且不是空目录或符号链接。" >&2
+            echo "checkpoint 要写到 ${CKPT_DIR}；请先手动挪走旧的 checkpoints 目录再重试。" >&2
+            return 1
+        fi
+    fi
+    ln -s "${CKPT_DIR}" "${CKPT_LINK}"
+    CKPT_REAL=$(cd "${CKPT_DIR}" && pwd -P)
+    if [ "${RESUME_MODE}" = auto ] && [ -z "$(ls -A "${CKPT_DIR}" 2>/dev/null)" ]; then
+        echo "警告：RESUME=1，但本地 checkpoint 目录是空的：${CKPT_DIR}" >&2
+        echo "      pod 重建后本地盘会被清空；这种情况无法续训，trainer 会从第 0 步开始。" >&2
+    fi
+}
+
+# BG 父进程和前台都先做一次：路径/权限/旧目录的问题立刻报错，而不是等到子进程的 log 里。
+setup_ckpt_dir
+
 if [ "${BG}" = 1 ]; then
     # setsid makes the child a process-group leader, so the pid file stops this job
     # (python + its local Ray cluster) without touching the other job on the node.
@@ -316,6 +392,11 @@ if [ "${BG}" = 1 ]; then
     echo "${pid}" > "${PID_FILE}"
     echo "EXP dir : ${EXP_DIR}"
     echo "ray tmp : ${RAY_TEMP_DIR}    # Ray session/logs live here (local disk)"
+    echo "ckpt    : ${CKPT_DIR}"
+    if [ "${CKPT_LOCAL}" = 1 ]; then
+        echo "ckpt link: ${CKPT_LINK} -> ${CKPT_DIR}    # 本地盘，pod 重建会丢"
+    fi
+    echo "python  : ${PYTHON_BIN}"
     echo "log     : ${LOG}"
     echo "metrics : ${METRICS}"
     echo "pid     : ${pid} (${PID_FILE})"
@@ -336,6 +417,9 @@ write_command() {
         printf 'export EXP=%q\n' "${EXP}"
         printf 'export SMOKE=%q\n' "${SMOKE}"
         printf 'export RESUME=%q\n' "${RESUME}"
+        printf 'export CKPT_ROOT=%q\n' "${CKPT_ROOT}"
+        printf 'export LOCAL_ROOT=%q\n' "${LOCAL_ROOT}"
+        printf 'export VERL_PYTHON=%q\n' "${VERL_PYTHON}"
         printf 'export VERL_FILE_LOGGER_PATH=%q\n' "${METRICS}"
         printf 'export VERL_ZMQ_JOB_TOKEN=%q\n' "${ZMQ_TOKEN}"
         printf 'export RAY_agent_register_timeout_ms=%q\n' "${RAY_agent_register_timeout_ms}"
@@ -362,8 +446,11 @@ update_meta() {
     META_MODEL_PATH="${MODEL_PATH}" \
     META_TS="${TS}" \
     META_RESUME="${RESUME_MODE}" \
-    META_LOG="${LOG}" \
-    META_METRICS="${METRICS}" \
+    META_LOG="${LOG_REL}" \
+    META_METRICS="${METRICS_REL}" \
+    META_CHECKPOINT_DIR="${CKPT_REAL}" \
+    META_CHECKPOINT_LOCAL="${CKPT_LOCAL}" \
+    META_PYTHON="${PYTHON_BIN}" \
     META_TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}" \
     META_ROLLOUT_N="${ROLLOUT_N}" \
     python3 - "$@" <<'PY'
@@ -386,6 +473,9 @@ meta["git_commit"] = os.environ["META_GIT_COMMIT"]
 meta["git_dirty"] = os.environ["META_GIT_DIRTY"] == "1"
 meta["host"] = os.environ["META_HOST"]
 meta["model_path"] = os.environ["META_MODEL_PATH"]
+meta["checkpoint_dir"] = os.environ["META_CHECKPOINT_DIR"]
+meta["checkpoint_local"] = os.environ["META_CHECKPOINT_LOCAL"] == "1"
+meta["python"] = os.environ["META_PYTHON"]
 meta["train_batch_size"] = int(os.environ["META_TRAIN_BATCH_SIZE"])
 meta["rollout_n"] = int(os.environ["META_ROLLOUT_N"])
 meta["overrides"] = sys.argv[1:]
@@ -411,24 +501,96 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 }
 
+CHILD_PID=""
+CHILD_STATUS=""
+SIGNAL_NUMBER=""
+
 finish() {
     local code=$?
-    if [ "${code}" -eq 0 ]; then
+    if [ -n "${CHILD_STATUS}" ]; then
+        code=${CHILD_STATUS}
+    fi
+    if [ -n "${SIGNAL_NUMBER}" ]; then
+        update_meta "failed (signal ${SIGNAL_NUMBER})" ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}
+    elif [ "${code}" -eq 0 ]; then
         update_meta finished ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}
     else
         update_meta "failed (exit ${code})" ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}
     fi
 }
+
+# SIGTERM/SIGINT/SIGHUP：转发给 python 子进程，并记住信号。EXIT trap 据此写
+# failed (signal N)；否则被杀掉的 job 会因为最后一条命令返回 0 而被写成 finished。
+forward_signal() {
+    local signo=$1 signame=$2
+    if [ -z "${SIGNAL_NUMBER}" ]; then
+        SIGNAL_NUMBER=${signo}
+        echo "收到 SIG${signame}：转发给子进程，状态记为 failed (signal ${signo})" >&2
+    fi
+    if [ -n "${CHILD_PID}" ] && kill -0 "${CHILD_PID}" 2>/dev/null; then
+        kill -s "${signame}" "${CHILD_PID}" 2>/dev/null || true
+    fi
+}
+
 trap finish EXIT
+trap 'forward_signal 15 TERM' TERM
+trap 'forward_signal 2 INT' INT
+trap 'forward_signal 1 HUP' HUP
 
 write_command
 update_meta running ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}
 
-if [ "${BG_CHILD:-0}" = 1 ]; then
-    # setsid makes this process the group leader; the pid file stops the whole job.
-    echo "$$" > "${PID_FILE}"
-    # Detached child: the BG parent already redirects stdout/stderr to $LOG.
-    "${VERL_PYTHON}" -m verl.trainer.main_ppo "${OVERRIDES[@]}"
-else
-    "${VERL_PYTHON}" -m verl.trainer.main_ppo "${OVERRIDES[@]}" 2>&1 | tee -a "${LOG}"
+if [ -n "${SIGNAL_NUMBER}" ]; then
+    exit 143  # 启动前就收到信号；EXIT trap 会记 failed (signal N)
 fi
+
+# python 放后台再 wait：这样才能拿到它自己的退出码（原来 `python | tee` 让 EXIT trap
+# 看到的是 tee 的 0，被判成 finished）。前台模式仍用 process substitution 把输出同时
+# 写到终端和 log，$! 仍是 python 的 pid。
+run_child() {
+    local status=0 waited=0 killed=0
+    if [ "${BG_CHILD:-0}" = 1 ]; then
+        # setsid makes this process the group leader; the pid file stops the whole job.
+        echo "$$" > "${PID_FILE}"
+        # Detached child: the BG parent already redirects stdout/stderr to $LOG.
+        "${VERL_PYTHON}" -m verl.trainer.main_ppo "${OVERRIDES[@]}" &
+    else
+        "${VERL_PYTHON}" -m verl.trainer.main_ppo "${OVERRIDES[@]}" > >(tee -a "${LOG}") 2>&1 &
+    fi
+    CHILD_PID=$!
+
+    while :; do
+        status=0
+        wait "${CHILD_PID}" || status=$?
+        if [ -z "${SIGNAL_NUMBER}" ]; then
+            break  # 没有信号：wait 只在子进程退出时返回
+        fi
+        # 收到信号时 wait 可能只是被打断（子进程还活着）。轮询到它消失；
+        # 15s 不退就 SIGKILL，最多再等 5s 收尸。
+        waited=0
+        killed=0
+        while kill -0 "${CHILD_PID}" 2>/dev/null; do
+            waited=$((waited + 1))
+            if [ "${killed}" = 0 ] && [ "${waited}" -ge 15 ]; then
+                echo "子进程 15s 内没有退出，发送 SIGKILL" >&2
+                kill -KILL "${CHILD_PID}" 2>/dev/null || true
+                killed=1
+            fi
+            if [ "${waited}" -ge 20 ]; then
+                break
+            fi
+            sleep 1
+        done
+        wait "${CHILD_PID}" 2>/dev/null || status=$?  # 收尸；状态已被信号接管
+        break
+    done
+
+    CHILD_STATUS=${status}
+    # 子进程被信号直接杀掉（外部 kill 了 python）时，wait 返回 128+N。
+    if [ -z "${SIGNAL_NUMBER}" ] && [ "${status}" -gt 128 ] && [ "${status}" -lt 160 ]; then
+        SIGNAL_NUMBER=$((status - 128))
+    fi
+}
+
+run_child
+exit "${CHILD_STATUS}"

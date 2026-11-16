@@ -7,6 +7,17 @@
 ## 约定
 
 - 命令都在 `$SEARCH_R1_HOME` 下执行，先 `source "$SEARCH_R1_HOME/.venv/bin/activate"`。
+- **从 Mac 启动用 `hc run --bg`，不要用 `hc exec`**：`hc exec` 返回时会杀掉它 spawn 的所有
+  进程（`setsid`/`nohup`/`tmux` 都不行），训练会以 `failed (signal 15)` 结束。长任务用
+  `hc run --on <machine> --bg --no-parent --name <名称> bash <脚本> [参数]` 开一个持久
+  终端（环境变量写在前面的 `bash <脚本>` 调用里），再用 `hc read <terminal> --lines 50` /
+  `hc wait <terminal>` 看输出。在交互式 WebShell/Herdr 终端里直接敲时 `BG=1` 仍然可用。
+- **先把 venv 和检索数据放本地盘，并让 checkpoint 也走本地盘**：上新 pod 先
+  `bash verl/examples/search_r1/stage_local.sh venv retrieval`（默认
+  `LOCAL_ROOT=/home/work/search_r1_local`），启动时加 `CKPT_ROOT=/home/work/ckpt`。共享
+  spfs 盘很慢；checkpoint 每个 25GB。本地盘的代价是 pod 重建会丢——200 步的消融丢了重跑
+  即可，跑完用 `keep_checkpoint.sh <EXP> best` 把最好的验证 checkpoint 归档到共享盘。
+  细节见 README。
 - 除 C1/C2 外，所有实验共享：
 
   ```bash

@@ -19,10 +19,14 @@ $SEARCH_R1_HOME/                 # 工作区根 = git 仓库根
 │   └── models/{Qwen3.5-2B,e5-base-v2}
 ├── experiments/<EXP>/
 │   ├── meta.json
-│   ├── checkpoints/
+│   ├── checkpoints/             # 默认目录；CKPT_ROOT 设置时是指向本地盘的符号链接
+│   ├── kept_checkpoints/        # keep_checkpoint.sh 归档到共享盘的 checkpoint
 │   └── runs/<TS>.{metrics.jsonl,log,command.sh,hydra/}
 └── logs/retriever.log
 ```
+
+`/home/work/search_r1_local`（`LOCAL_ROOT`）是容器本地 overlay 上的加速目录，不在工作区里；
+`stage_local.sh` 把 venv 和检索数据放过去，pod 重建后重跑一次即可（见下文）。
 
 `SEARCH_R1_HOME` 默认是代码目录（`verl/`）的上一级，也就是工作区/git 仓库根
 （脚本在 `verl/examples/search_r1/`，向上三级）。所有路径都可以用环境变量覆盖
@@ -38,6 +42,36 @@ source "$SEARCH_R1_HOME/.venv/bin/activate"
 
 `uv` 不在服务器的 PATH 里，用 `.tools/uv`；先激活 `.venv`，脚本里的 `python3` 都来自它
 （包括 `start_retriever.sh`）。不要用 `uv run` / `uv sync`（见文末的坑）。
+
+## 本地盘加速：LOCAL_ROOT 与 stage_local.sh
+
+`$SEARCH_R1_HOME` 挂在 spfs（慢速网络 FUSE，95% 满）；容器本地的 overlay（`/`，约 2.7T
+空闲）快得多，但 pod/run 结束就清空。`stage_local.sh` 把大件拷到本地盘：
+
+```bash
+bash verl/examples/search_r1/stage_local.sh            # 等价于 all
+bash verl/examples/search_r1/stage_local.sh venv       # 只搞 venv
+bash verl/examples/search_r1/stage_local.sh retrieval  # 只搞检索数据
+```
+
+默认 `LOCAL_ROOT=/home/work/search_r1_local`（故意放在 `mshop-agent-1` 之外，属于本地盘；
+可以覆盖，但脚本会拒绝指向工作区）：
+
+- `venv`：`rsync -a --delete`（没有 rsync 就 `cp -a`）把 `$SEARCH_R1_HOME/.venv` 拷到
+  `$LOCAL_ROOT/.venv`，然后把写死旧路径的地方改掉——`bin/*` 里以旧 venv 开头的 shebang，
+  以及 `bin/activate*` 里的 `VIRTUAL_ENV`（`pyvenv.cfg` 不用改，`home` 指向系统 python）。
+  可编辑安装的 `.pth`/finder 仍指向 `$SEARCH_R1_HOME/verl`，不要动；脚本会用
+  `"$LOCAL_ROOT/.venv/bin/python" -c "import verl, torch, vllm, faiss"` 验证。然后用
+  `compileall -j 16` 预热 `__pycache__`，并打印本地/共享 venv 各自
+  `python -c 'import torch, vllm'` 的耗时（冷节点上共享 venv 要 2 分钟以上）。
+- `retrieval`：把 `data/retrieval/{e5_Flat.index,wiki-18.jsonl}` 和 `data/models/e5-base-v2`
+  拷到 `$LOCAL_ROOT/data/...`；大小一致的文件直接跳过，打印吞吐。
+
+脚本幂等，可重复跑。之后 launcher 在未显式设置 `VERL_PYTHON` 时会自动用
+`$LOCAL_ROOT/.venv/bin/python`（Ray worker 用 `sys.executable`，整个集群跟着走），
+`start_retriever.sh` 在 `$LOCAL_ROOT/data` 的索引/语料/模型都在时自动用本地数据和
+本地 python；显式 `VERL_PYTHON=...` 仍然优先，`LOCAL_ROOT=` 可以关掉本地盘路径。
+`DRY_RUN=1` 会打印实际用的 `VERL_PYTHON`/`PYTHON_BIN`，`meta.json` 记录 `python`。
 
 ## 预处理
 
@@ -73,13 +107,30 @@ SMOKE=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 EXP=demo DRY_RUN=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 ```
 
+## 在这台 pod 上启动长任务（hc run）
+
+从 Mac 上**不要**用 `hc exec` 跑训练：`hc exec` 返回时会把这次调用 spawn 的所有进程杀
+掉（`setsid`/`nohup`/`tmux` 都不管用），job 会被 SIGTERM 杀掉（`meta.json` 会写
+`failed (signal 15)`）。长任务用 `hc run --bg` 开一个持久终端：
+
+```bash
+hc run --on <machine> --bg --no-parent --name search-r1-<EXP> \
+    bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh ...
+hc read <terminal> --lines 50     # 看输出
+hc wait <terminal>                # 等它结束
+```
+
+`<machine>` 用 `hc machine ls` 里的 `pod-<runId>-…`。如果直接在交互式 WebShell/Herdr
+终端里敲命令，`BG=1` 仍然可用（pid 文件和进程组控制不变）。
+
 ## 正式训练
 
 ```bash
 EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
 ```
 
-`EXP` 是唯一的实验名（同时也是 trainer 的 experiment_name、实验目录和 checkpoint 目录）。
+`EXP` 是唯一的实验名（同时也是 trainer 的 experiment_name、实验目录和默认 checkpoint
+目录 `$EXP_DIR/checkpoints`；用 `CKPT_ROOT` 时 checkpoint 实际在本地盘，见下节）。
 `GPUS=0,1,2,3` / `VAL=full` 是默认值：`GPUS` 决定 `CUDA_VISIBLE_DEVICES`，并按个数设置
 `trainer.n_gpus_per_node`；`VAL=sub` 换成 `test_sub.parquet`（分层抽样，验证更快）。
 `BG=1` 会 nohup 到后台，打印实验目录、log、metrics、PID、pid 文件和 `tail -f` 命令。
@@ -87,14 +138,52 @@ EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grp
 
 每次训练都会写 `runs/<TS>.command.sh`（可重放）、`runs/<TS>.hydra/` 和
 `runs/<TS>.pid`（仅 `BG=1`），并更新 `meta.json`（`status` 从 `running` 到
-`finished` / `failed (exit N)`，另外记录生效后的 `train_batch_size`、`rollout_n` 和
-`overrides`，dashboard 用它们算 samples seen）。
+`finished` / `failed (exit N)` / `failed (signal N)`；被 SIGTERM/SIGINT/SIGHUP 杀掉时记
+`failed (signal N)`，不会写成 `finished`。另外记录生效后的 `train_batch_size`、`rollout_n`、
+`overrides`、`checkpoint_dir`、`checkpoint_local` 和实际用的 `python`；
+`launches[].log`/`.metrics` 是相对实验目录的路径）。
 额外的 Hydra override 直接作为参数追加，优先级最高：
 
 ```bash
 EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
     actor_rollout_ref.actor.optim.lr=5e-7
 ```
+
+## Checkpoint 放本地盘：CKPT_ROOT
+
+checkpoint 是 FSDP 模型 + fp32 optimizer，每个 25GB（4 rank），写共享盘很慢。设置
+`CKPT_ROOT` 后写到本地盘：
+
+```bash
+EXP=search-r1-001 CKPT_ROOT=/home/work/ckpt BG=1 \
+    bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh
+```
+
+实际目录是 `$CKPT_ROOT/<EXP>`（smoke 是 `$CKPT_ROOT/smoke/<TS>-smoke`，和 experiments/
+下的相对路径一致，两个实验不会互相覆盖），并建符号链接
+`$EXP_DIR/checkpoints -> $CKPT_ROOT/<EXP>`：`RESUME=1` 和平常找 checkpoint 都用这个固定
+路径。已有的符号链接会被替换；真实的非空目录会被拒绝（避免把旧 checkpoint 藏起来）。
+`meta.json` 记录 `checkpoint_dir`（真实路径）和 `checkpoint_local`。
+
+**风险**：本地盘在 pod/run 重建时清空，checkpoint 一起丢，**RESUME 不可能**（`RESUME=1`
+但本地目录为空时脚本会警告，trainer 从第 0 步开始）。200 步的消融丢了重跑可以接受；
+长训练不要用 `CKPT_ROOT`，或者定期用下面的脚本往共享盘归档。
+
+## 归档 checkpoint：keep_checkpoint.sh
+
+```bash
+bash verl/examples/search_r1/keep_checkpoint.sh <EXP> latest
+bash verl/examples/search_r1/keep_checkpoint.sh <EXP> 200
+bash verl/examples/search_r1/keep_checkpoint.sh <EXP> best          # 推荐
+bash verl/examples/search_r1/keep_checkpoint.sh <EXP> best --move   # 校验后删本地副本
+```
+
+把 `$EXP_DIR/checkpoints/global_step_<N>`（CKPT_ROOT 时通过符号链接读本地盘）拷到**共享盘**
+`$EXP_DIR/kept_checkpoints/global_step_<N>`，打印源/目标大小、文件数和拷贝耗时，并校验
+文件数 + 字节数一致。`best` 从 `runs/*.metrics.jsonl` 里取每个验证 step 的 7 个
+`val-core/searchR1_*/acc/mean@1` 做未加权平均，挑平均最高的验证 step，再取**已保存的、
+最接近且 ≤ 它的 step**（会打印 val best 和实际保存的是哪个 step）。`--move` 在校验通过后
+删掉本地副本——注意如果删的是最新 checkpoint，`RESUME=1` 会找不到它（脚本会警告）。
 
 ## 一个节点并行跑两个实验（每个 2 卡）
 
@@ -165,6 +254,9 @@ EXP=search-r1-001 RESUME=1 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_sear
 
 `RESUME=1` 要求实验目录已存在，并设置 `trainer.resume_mode=auto`。
 不加 `RESUME=1` 时，如果 `experiments/<EXP>` 已存在会直接报错，避免覆盖旧实验。
+用 `CKPT_ROOT` 时，续训从 `$EXP_DIR/checkpoints`（本地盘符号链接）找 checkpoint；
+pod 重建后本地 checkpoint 已经丢了，脚本会警告并从第 0 步开始——要跨 pod 续训，提前用
+`keep_checkpoint.sh` 把需要的 step 归档到共享盘。
 
 ## 导出 metrics
 
@@ -182,6 +274,11 @@ bash verl/examples/search_r1/pack_metrics.sh all             # 所有实验打�
 - **`use_remove_padding=True` 会让 Qwen3.5 崩**：GatedDeltaNet 下 rollout 与训练的
   KL 从 6e-4 涨到 ~0.05，训练在 60 步左右 collapse。本 recipe 固定为 `False`，并把
   `ppo_max_token_len_per_gpu` 降到 12288（不开 rmpad 时 24576 峰值约 219GB）。
+- **不要用 `hc exec` 跑训练**：`hc exec` 返回时会杀掉它 spawn 的所有进程（`setsid`/
+  `nohup`/`tmux` 也不行），job 以 `failed (signal 15)` 结束。长任务用
+  `hc run --on <machine> --bg --no-parent --name <n> bash <script>`。
+- **`CKPT_ROOT` 是本地盘，pod/run 重建就没了**：checkpoint 丢了就没法 `RESUME`；
+  长训练要么不用 `CKPT_ROOT`，要么定期 `keep_checkpoint.sh` 归档。
 - **不要复用已有 EXP**：第二次训练会被拒绝；要接着跑就加 `RESUME=1`，否则换一个 `EXP`。
 - **同时跑两个实验时不要用 `ray stop --force`**：它会连带杀掉同节点另一个 job 的 Ray；
   用 `experiments/<EXP>/runs/<TS>.pid` 杀本 job 的进程组（见上一节）。
