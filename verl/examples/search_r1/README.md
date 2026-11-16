@@ -61,16 +61,20 @@ bash verl/examples/search_r1/stage_local.sh retrieval  # 只搞检索数据
   `$LOCAL_ROOT/.venv`，然后把写死旧路径的地方改掉——`bin/*` 里以旧 venv 开头的 shebang，
   以及 `bin/activate*` 里的 `VIRTUAL_ENV`（`pyvenv.cfg` 不用改，`home` 指向系统 python）。
   可编辑安装的 `.pth`/finder 仍指向 `$SEARCH_R1_HOME/verl`，不要动；脚本会用
-  `"$LOCAL_ROOT/.venv/bin/python" -c "import verl, torch, vllm, faiss"` 验证。然后用
+  `"$LOCAL_ROOT/.venv/bin/python" -c "import verl, torch, vllm, faiss"` 验证。验证通过后
+  才写完成标记 `$LOCAL_ROOT/.venv.ok`。然后用
   `compileall -j 16` 预热 `__pycache__`，并打印本地/共享 venv 各自
   `python -c 'import torch, vllm'` 的耗时（冷节点上共享 venv 要 2 分钟以上）。
 - `retrieval`：把 `data/retrieval/{e5_Flat.index,wiki-18.jsonl}` 和 `data/models/e5-base-v2`
-  拷到 `$LOCAL_ROOT/data/...`；大小一致的文件直接跳过，打印吞吐。
+  拷到 `$LOCAL_ROOT/data/...`；大小一致的文件直接跳过，打印吞吐。全部拷完并逐文件校验
+  大小后，才写完成标记 `$LOCAL_ROOT/data/.retrieval.ok`。
 
-脚本幂等，可重复跑。之后 launcher 在未显式设置 `VERL_PYTHON` 时会自动用
-`$LOCAL_ROOT/.venv/bin/python`（Ray worker 用 `sys.executable`，整个集群跟着走），
-`start_retriever.sh` 在 `$LOCAL_ROOT/data` 的索引/语料/模型都在时自动用本地数据和
-本地 python；显式 `VERL_PYTHON=...` 仍然优先，`LOCAL_ROOT=` 可以关掉本地盘路径。
+两处标记都会在开始拷贝对应部分时先删掉，所以拷贝中断、失败或 venv 验证不通过时标记
+不存在。脚本幂等，可重复跑。之后 launcher 在未显式设置 `VERL_PYTHON` 且
+`$LOCAL_ROOT/.venv.ok` 存在时才用 `$LOCAL_ROOT/.venv/bin/python`（Ray worker 用
+`sys.executable`，整个集群跟着走）；`start_retriever.sh` 同样只认标记，`data/.retrieval.ok`
+存在才用本地数据和本地 python。本地目录存在但缺标记时，脚本会打印一行提示并回落到共享盘；
+显式 `VERL_PYTHON=...` 仍然优先，`LOCAL_ROOT=` 可以关掉本地盘路径。
 `DRY_RUN=1` 会打印实际用的 `VERL_PYTHON`/`PYTHON_BIN`，`meta.json` 记录 `python`。
 
 ## 预处理
@@ -164,6 +168,10 @@ EXP=search-r1-001 CKPT_ROOT=/home/work/ckpt BG=1 \
 `$EXP_DIR/checkpoints -> $CKPT_ROOT/<EXP>`：`RESUME=1` 和平常找 checkpoint 都用这个固定
 路径。已有的符号链接会被替换；真实的非空目录会被拒绝（避免把旧 checkpoint 藏起来）。
 `meta.json` 记录 `checkpoint_dir`（真实路径）和 `checkpoint_local`。
+
+pod 重建后如果**不带** `CKPT_ROOT` 启动，`$EXP_DIR/checkpoints` 可能还是指向已清空本地盘
+的失效符号链接；脚本会明确报错退出（不会自动删除），按提示设置 `CKPT_ROOT` 重跑或手动
+删除该链接即可。
 
 **风险**：本地盘在 pod/run 重建时清空，checkpoint 一起丢，**RESUME 不可能**（`RESUME=1`
 但本地目录为空时脚本会警告，trainer 从第 0 步开始）。200 步的消融丢了重跑可以接受；

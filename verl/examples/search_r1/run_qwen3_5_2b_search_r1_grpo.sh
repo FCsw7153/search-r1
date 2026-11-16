@@ -11,7 +11,7 @@
 #   [DRY_RUN=1] ...            print resolved paths and the command, create nothing
 #
 # CKPT_ROOT（默认空 = 旧行为）把 checkpoint 写到本地盘（见 README）；LOCAL_ROOT 里有
-# stage_local.sh 准备好的 .venv 时，未显式设置 VERL_PYTHON 就用它（Ray worker 继承
+# stage_local.sh 完成标记的 .venv 时，未显式设置 VERL_PYTHON 就用它（Ray worker 继承
 # sys.executable，所以整个集群都走本地 venv）。
 
 set -euo pipefail
@@ -49,11 +49,16 @@ TOOL_CONFIG=${TOOL_CONFIG:-${CODE_DIR}/examples/search_r1/config/search_tool_con
 LOCAL_ROOT=${LOCAL_ROOT-/home/work/search_r1_local}
 # 为空 = checkpoint 仍在 $EXP_DIR/checkpoints（旧行为）；设置后放本地盘并在实验目录留符号链接。
 CKPT_ROOT=${CKPT_ROOT:-}
-# VERL_PYTHON 显式设置时优先；否则有 $LOCAL_ROOT/.venv 就用它的 python。
+# VERL_PYTHON 显式设置时优先；否则 stage_local.sh 打好完成标记（.venv.ok）才用本地 venv。
+# 只看 bin/python 不够：它是复制刚开始就出现的符号链接，半截 venv 会被误用。
 VERL_PYTHON_SET=${VERL_PYTHON:+1}
 VERL_PYTHON=${VERL_PYTHON:-python3}
-if [ -z "${VERL_PYTHON_SET}" ] && [ -n "${LOCAL_ROOT}" ] && [ -x "${LOCAL_ROOT}/.venv/bin/python" ]; then
-    VERL_PYTHON=${LOCAL_ROOT}/.venv/bin/python
+if [ -z "${VERL_PYTHON_SET}" ] && [ -n "${LOCAL_ROOT}" ]; then
+    if [ -f "${LOCAL_ROOT}/.venv.ok" ]; then
+        VERL_PYTHON=${LOCAL_ROOT}/.venv/bin/python
+    elif [ -e "${LOCAL_ROOT}/.venv" ]; then
+        echo "本地 venv 不完整（缺少完成标记 ${LOCAL_ROOT}/.venv.ok）：回落到共享盘的 python"
+    fi
 fi
 if command -v "${VERL_PYTHON}" >/dev/null 2>&1; then
     PYTHON_BIN=$(command -v "${VERL_PYTHON}")
@@ -355,6 +360,15 @@ mkdir -p "${EXP_DIR}/runs"
 # 空的情况下才替换，非空目录拒绝（避免把已有 checkpoint 藏起来）。
 setup_ckpt_dir() {
     if [ -z "${CKPT_ROOT}" ]; then
+        # 之前用 CKPT_ROOT 跑过、pod 重建后本地盘被清空时，checkpoints 会变成失效的
+        # 符号链接；mkdir -p 只会报一句含糊的 "File exists"。这里不自动删除，交给用户决定。
+        if [ -L "${CKPT_DIR}" ] && [ ! -e "${CKPT_DIR}" ]; then
+            echo "拒绝：${CKPT_DIR} 是失效的符号链接 -> $(readlink "${CKPT_DIR}")" >&2
+            echo "      链接目标已不存在（pod 重建会清空本地盘）。两种做法：" >&2
+            echo "      1) 设置 CKPT_ROOT 重跑：会从头开始训练，原来的 checkpoint 已无法续训；" >&2
+            echo "      2) 手动删除这个链接后重试：rm '${CKPT_DIR}'" >&2
+            return 1
+        fi
         mkdir -p "${CKPT_DIR}"
         CKPT_REAL=$(cd "${CKPT_DIR}" && pwd -P)
         return 0

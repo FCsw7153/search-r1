@@ -31,6 +31,11 @@ SRC_VENV=${SEARCH_R1_HOME}/.venv
 DST_VENV=${LOCAL_ROOT}/.venv
 SRC_DATA=${SEARCH_R1_HOME}/data
 DST_DATA=${LOCAL_ROOT}/data
+# 完成标记：launcher / start_retriever.sh 只认这两个文件，不认“目录存在”。
+# bin/python 是复制刚开始就出现的符号链接，半截 venv 会被误用。venv 标记放在 .venv
+# 外面，rsync --delete / cp -a 不会碰到它。
+VENV_MARKER=${LOCAL_ROOT}/.venv.ok
+RETRIEVAL_MARKER=${DST_DATA}/.retrieval.ok
 
 if [ "$#" -eq 0 ]; then
     set -- all
@@ -99,6 +104,7 @@ fix_venv_paths() {
 }
 
 stage_venv() {
+    rm -f "${VENV_MARKER}"   # 先删标记：中途失败/中断时不能留下“已完成”
     if [ ! -x "${SRC_VENV}/bin/python" ]; then
         echo "找不到共享 venv: ${SRC_VENV}" >&2
         return 1
@@ -131,6 +137,9 @@ stage_venv() {
         echo "  editable 安装的 .pth/finder 应指向 ${SEARCH_R1_HOME}/verl；检查一下再重跑。" >&2
         return 1
     fi
+    # 复制、路径修正、import 验证都通过后才写标记。
+    : > "${VENV_MARKER}"
+    echo "  marker: ${VENV_MARKER}"
 
     TIMEFORMAT='%3R s'
     echo "== time python -c 'import torch, vllm'"
@@ -201,11 +210,26 @@ copy_tree() {
 }
 
 stage_retrieval() {
+    rm -f "${RETRIEVAL_MARKER}"   # 先删标记：中途失败/中断时不能留下“已完成”
     echo "== retrieval: ${SRC_DATA} -> ${DST_DATA}"
     mkdir -p "${DST_DATA}/retrieval" "${DST_DATA}/models"
     copy_file "${SRC_DATA}/retrieval/e5_Flat.index" "${DST_DATA}/retrieval/e5_Flat.index"
     copy_file "${SRC_DATA}/retrieval/wiki-18.jsonl" "${DST_DATA}/retrieval/wiki-18.jsonl"
     copy_tree "${SRC_DATA}/models/e5-base-v2" "${DST_DATA}/models/e5-base-v2"
+
+    # copy_file 已校验两个大文件；模型树再逐文件比对大小，确认没有半截目录。
+    local f rel
+    while IFS= read -r -d '' f; do
+        rel=${f#"${SRC_DATA}/models/e5-base-v2"/}
+        if [ ! -f "${DST_DATA}/models/e5-base-v2/${rel}" ] \
+            || [ "$(wc -c < "${f}")" -ne "$(wc -c < "${DST_DATA}/models/e5-base-v2/${rel}")" ]; then
+            echo "校验失败：${DST_DATA}/models/e5-base-v2/${rel}" >&2
+            return 1
+        fi
+    done < <(find "${SRC_DATA}/models/e5-base-v2" -type f -print0)
+
+    : > "${RETRIEVAL_MARKER}"
+    echo "  marker: ${RETRIEVAL_MARKER}"
 }
 
 if [ "${want_venv}" = 1 ]; then
@@ -216,5 +240,6 @@ if [ "${want_retrieval}" = 1 ]; then
 fi
 
 echo "== done. LOCAL_ROOT=${LOCAL_ROOT}"
-echo "   之后 launcher / start_retriever.sh 会自动优先用本地 venv 和检索数据；"
+echo "   标记位置：${VENV_MARKER} / ${RETRIEVAL_MARKER}"
+echo "   之后 launcher / start_retriever.sh 只认标记存在且完整的本地副本；"
 echo "   想强制用共享盘：LOCAL_ROOT= bash <script>"
