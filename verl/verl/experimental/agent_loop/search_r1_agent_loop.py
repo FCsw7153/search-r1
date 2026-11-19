@@ -56,6 +56,8 @@ SEARCH_R1_BASE_TEMPLATE = (
 )
 
 SEARCH_R1_STOP_STRINGS = ("</search>", "</answer>")
+# Why a trajectory stopped; reported per sample and aggregated as one 0/1 metric each.
+SEARCH_R1_END_REASONS = ("answer", "turn_cap", "length", "no_action")
 _SEARCH_ACTION_PATTERN = re.compile(r"<search>(.*?)</search>", re.DOTALL)
 
 
@@ -164,12 +166,16 @@ class SearchR1AgentLoop(AgentLoopBase):
         metrics: dict[str, Any] = {}
         assistant_turns = 0
         user_turns = 0
+        search_queries: list[str] = []
+        end_reason = "no_action"
 
         while True:
             if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
+                end_reason = "turn_cap"
                 break
             remaining = self.response_length - len(response_ids)
             if remaining <= 0:
+                end_reason = "length"
                 break
 
             # vLLM includes the matched stop string in the returned token ids with
@@ -200,6 +206,7 @@ class SearchR1AgentLoop(AgentLoopBase):
             assistant_turns += 1
             turn_ids = list(output.token_ids[:remaining])
             if not turn_ids:
+                end_reason = "no_action"
                 break
             response_ids.extend(turn_ids)
             response_mask.extend([1] * len(turn_ids))
@@ -213,22 +220,43 @@ class SearchR1AgentLoop(AgentLoopBase):
             )
             action, query = parse_search_r1_action(turn_text)
             if action != "search":
+                end_reason = "answer" if action == "answer" else "no_action"
+                break
+
+            # Do not search after the last allowed generation or with no response budget left:
+            # the loop ends on the next iteration anyway, so an appended information block would
+            # only add masked tokens. This also keeps num_turns <= 2 * max_assistant_turns.
+            if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
+                end_reason = "turn_cap"
+                break
+            if len(response_ids) >= self.response_length:
+                end_reason = "length"
                 break
 
             with simple_timer("tool_calls", metrics):
                 documents = await self._search(query)
+            search_queries.append(query)
             observation = f"\n\n<information>{documents}</information>\n\n"
             observation_ids = await self.loop.run_in_executor(
                 None, lambda text=observation: self.tokenizer(text, add_special_tokens=False)["input_ids"]
             )
             observation_ids = list(observation_ids[: self.response_length - len(response_ids)])
             if not observation_ids:
+                end_reason = "length" if len(response_ids) >= self.response_length else "no_action"
                 break
             response_ids.extend(observation_ids)
             response_mask.extend([0] * len(observation_ids))
             if response_logprobs is not None:
                 response_logprobs.extend([0.0] * len(observation_ids))
             user_turns += 1
+
+        extra_fields.update(
+            {
+                "search_r1_end_reason": end_reason,
+                "search_r1_num_searches": len(search_queries),
+                "search_r1_queries": search_queries,
+            }
+        )
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,

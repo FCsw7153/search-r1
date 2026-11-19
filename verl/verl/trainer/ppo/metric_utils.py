@@ -1003,8 +1003,9 @@ def process_validation_metrics(
 
             for var_name, var_vals in var2vals.items():
                 var_vals = [value for value in var_vals if value is not None]
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Skip empty, string, and non-scalar values (e.g. the search_r1_agent query
+                # list): they are still written to the dump, but cannot be aggregated.
+                if not var_vals or isinstance(var_vals[0], str) or not np.isscalar(var_vals[0]):
                     continue
                 has_pred = (
                     pred_vals is not None

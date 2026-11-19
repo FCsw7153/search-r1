@@ -1402,7 +1402,7 @@ class PPOTrainer(ABC):
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
@@ -1418,6 +1418,18 @@ class PPOTrainer(ABC):
             else:
                 gts = [None] * len(uids)
 
+            # Per-sample reward diagnostics (e.g. search_r1_agent termination reason and
+            # queries) live in extra_fields.reward_extra_info; dump them next to the text.
+            extra_fields = data.pop("extra_fields", None)
+            reward_extra_infos = (
+                [
+                    extra.get("reward_extra_info", {}) if isinstance(extra, dict) else {}
+                    for extra in extra_fields.tolist()
+                ]
+                if extra_fields is not None
+                else [{} for _ in uids]
+            )
+
             # Sort by uid key ({sample}_{rollout}_{output})
             sort_keys = []
             for key in batch.keys:
@@ -1432,8 +1444,11 @@ class PPOTrainer(ABC):
             outputs = [outputs[i] for i in sorted_indices]
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
+            reward_extra_infos = [reward_extra_infos[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            for key in sorted({key for info in reward_extra_infos for key in info}):
+                reward_extra_infos_dict[key] = [info.get(key) for info in reward_extra_infos]
 
             self._dump_generations(
                 inputs=inputs,
@@ -2023,6 +2038,7 @@ class PPOTrainer(ABC):
             "rm_scores",
             "token_level_rewards",
             "num_turns",
+            "extra_fields",
         ]
         if self.use_critic:
             fields.append("values")
@@ -2038,6 +2054,7 @@ class PPOTrainer(ABC):
         )
 
         num_turns = np.array(data.pop("num_turns").tolist())
+        extra_fields = data.pop("extra_fields", None)
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -2108,11 +2125,27 @@ class PPOTrainer(ABC):
             }
         )
 
-        # 4. per-request speculative-decoding aggregation (same metrics async PPO logs;
+        # 4. per-trajectory reward diagnostics: the reward loop writes them into
+        # extra_fields.reward_extra_info. Aggregate numeric values only (the 0/1 termination
+        # indicators make the mean a fraction), mirroring _validate's val-aux aggregation.
+        if extra_fields is not None:
+            reward_extra_values: dict[str, list[float]] = defaultdict(list)
+            for extra_field, keep in zip(extra_fields.tolist(), non_padding_mask, strict=True):
+                if not keep or not isinstance(extra_field, dict):
+                    continue
+                for key, value in (extra_field.get("reward_extra_info") or {}).items():
+                    if isinstance(value, bool) or isinstance(value, (int, float)):
+                        reward_extra_values[key].append(float(value))
+            for key, values in reward_extra_values.items():
+                metrics[f"training/reward_extra/{key}/mean"] = float(np.mean(values))
+                metrics[f"training/reward_extra/{key}/min"] = float(np.min(values))
+                metrics[f"training/reward_extra/{key}/max"] = float(np.max(values))
+
+        # 5. per-request speculative-decoding aggregation (same metrics async PPO logs;
         # see compute_spec_decode_metrics in verl/trainer/ppo/ray_trainer.py).
         metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
 
-        # 5. off-policy staleness metrics
+        # 6. off-policy staleness metrics
         #   global_steps is the model weight version (one update_weights per global_step), and
         #   min/max_global_steps are the versions a trajectory was generated across, so all quantities
         #   below are already in model-version units.

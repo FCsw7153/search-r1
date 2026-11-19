@@ -243,6 +243,11 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
         assert score == 1.0
         assert search_r1_like_qa_em.compute_score(solution_str=response_text, ground_truth={"target": ["Beijing"]}) == 0
 
+        # Termination diagnostics ride along in extra_fields for the reward/metrics path.
+        assert output.extra_fields["search_r1_end_reason"] == "answer"
+        assert output.extra_fields["search_r1_num_searches"] == 1
+        assert output.extra_fields["search_r1_queries"] == ["capital of France"]
+
     async def test_no_tag_stops_without_search(self):
         server = FakeLLMServer(self.tokenizer, ["<think>I am not sure, no tag at all"])
         loop = _make_loop(self.tokenizer, server, FakeSearchTool())
@@ -253,8 +258,11 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
         assert output.num_turns == 2
         assert set(output.response_mask) == {1}
         assert output.response_logprobs is None
+        assert output.extra_fields["search_r1_end_reason"] == "no_action"
+        assert output.extra_fields["search_r1_num_searches"] == 0
+        assert output.extra_fields["search_r1_queries"] == []
 
-    async def test_max_assistant_turns_caps_generations(self):
+    async def test_max_assistant_turns_caps_generations_without_a_trailing_search(self):
         tool = FakeSearchTool()
         server = FakeLLMServer(
             self.tokenizer,
@@ -269,10 +277,47 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
         output = await loop.run({"logprobs": False}, raw_prompt=RAW_PROMPT)
 
         assert len(server.calls) == 2
-        assert tool.queries == ["q1", "q2"]
-        assert output.num_turns == 5  # two assistant turns + two information turns + 1
+        # The final allowed generation still ends with </search>, but it must not search.
+        assert tool.queries == ["q1"]
+        assert output.num_turns == 4  # two assistant turns + one information turn + 1
+        assert output.num_turns <= 2 * loop.max_assistant_turns
         response_text = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
+        assert "<search> q2 </search>" in response_text
         assert "never reached" not in response_text
+        assert "<information>" in response_text
+        assert output.extra_fields["search_r1_end_reason"] == "turn_cap"
+        assert output.extra_fields["search_r1_num_searches"] == 1
+        assert output.extra_fields["search_r1_queries"] == ["q1"]
+
+    async def test_single_turn_cap_does_not_search(self):
+        tool = FakeSearchTool()
+        server = FakeLLMServer(self.tokenizer, ["<think>x</think><search> q </search>"])
+        loop = _make_loop(self.tokenizer, server, tool, max_assistant_turns=1)
+
+        output = await loop.run({"logprobs": False}, raw_prompt=RAW_PROMPT)
+
+        assert len(server.calls) == 1
+        assert tool.queries == []
+        assert output.num_turns == 2
+        assert set(output.response_mask) == {1}
+        assert output.extra_fields["search_r1_end_reason"] == "turn_cap"
+        assert output.extra_fields["search_r1_num_searches"] == 0
+
+    async def test_no_budget_after_generation_does_not_search(self):
+        turn_text = "<search> q </search>"
+        turn_ids = self.tokenizer(turn_text, add_special_tokens=False)["input_ids"]
+        tool = FakeSearchTool()
+        server = FakeLLMServer(self.tokenizer, [turn_text, "<answer> unreachable </answer>"])
+        loop = _make_loop(self.tokenizer, server, tool, response_length=len(turn_ids), max_assistant_turns=4)
+
+        output = await loop.run({"logprobs": False}, raw_prompt=RAW_PROMPT)
+
+        assert len(server.calls) == 1
+        assert tool.queries == []
+        assert output.num_turns == 2
+        assert len(output.response_ids) == len(turn_ids)
+        assert output.extra_fields["search_r1_end_reason"] == "length"
+        assert output.extra_fields["search_r1_num_searches"] == 0
 
     async def test_total_response_budget_truncates_information(self):
         turn_text = "<search> q </search>"
@@ -295,6 +340,9 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
             "\n\n<information>" + "x" * 200 + "</information>\n\n", add_special_tokens=False
         )["input_ids"]
         assert output.response_ids[len(turn_ids) :] == observation_ids[:12]
+        assert output.extra_fields["search_r1_end_reason"] == "length"
+        assert output.extra_fields["search_r1_num_searches"] == 1
+        assert output.extra_fields["search_r1_queries"] == ["q"]
 
     async def test_generation_is_capped_by_remaining_budget(self):
         # The fake server ignores max_tokens and returns more tokens than the remaining budget.
@@ -309,6 +357,7 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
         assert server.calls[0]["sampling_params"]["max_tokens"] == response_length
         assert len(output.response_ids) == response_length
         assert set(output.response_mask) == {1}
+        assert output.extra_fields["search_r1_end_reason"] == "no_action"
 
     async def test_search_failure_becomes_observation(self):
         server = FakeLLMServer(
@@ -325,6 +374,37 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
         response_text = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
         assert "Search failed: retriever down" in response_text
         assert len(server.calls) == 2
+        assert output.extra_fields["search_r1_end_reason"] == "answer"
+        assert output.extra_fields["search_r1_num_searches"] == 1
+        assert output.extra_fields["search_r1_queries"] == ["q"]
+
+    def test_reward_reports_termination_metrics(self):
+        extra_info = {
+            "search_r1_end_reason": "turn_cap",
+            "search_r1_num_searches": 2,
+            "search_r1_queries": ["first", "second"],
+        }
+        result = search_r1_like_qa_em.compute_score(
+            solution_str="<answer> Paris </answer>",
+            ground_truth={"target": ["Paris"]},
+            extra_info=extra_info,
+        )
+        assert isinstance(result, dict)
+        assert result["score"] == 1.0
+        assert result["acc"] == 1.0
+        assert result["search_r1_end_reason"] == "turn_cap"
+        assert result["search_r1_end_turn_cap"] == 1.0
+        assert result["search_r1_end_answer"] == 0.0
+        assert result["search_r1_num_searches"] == 2
+        assert result["search_r1_queries"] == ["first", "second"]
+
+        # Without agent-loop diagnostics the reward keeps its scalar contract.
+        assert (
+            search_r1_like_qa_em.compute_score(
+                solution_str="<answer> Paris </answer>", ground_truth={"target": ["Paris"]}
+            )
+            == 1.0
+        )
 
 
 if __name__ == "__main__":

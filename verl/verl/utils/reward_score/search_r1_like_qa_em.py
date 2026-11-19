@@ -19,6 +19,33 @@ import random
 import re
 import string
 
+# ``search_r1_agent`` reports why each trajectory stopped. These names mirror the agent loop's
+# ``end_reason``; they are exposed as one 0/1 metric each so the mean is the fraction.
+SEARCH_R1_END_REASONS = ("answer", "turn_cap", "length", "no_action")
+
+
+def _with_termination_info(score_value, extra_info):
+    """Return ``score_value`` plus the agent loop's per-trajectory diagnostics, if present.
+
+    The agent loop writes them into ``extra_fields``; the reward manager forwards that dict as
+    ``extra_info``. A dict result keeps the scalar reward under ``score``/``acc`` and lets verl
+    aggregate the numeric fields and dump the string reason and query list. Without the
+    diagnostics (e.g. ``tool_agent``) the plain ``score_value`` is returned unchanged.
+    """
+    if not extra_info or "search_r1_end_reason" not in extra_info:
+        return score_value
+    end_reason = str(extra_info["search_r1_end_reason"])
+    info = {
+        "score": float(score_value),
+        "acc": float(score_value),
+        "search_r1_end_reason": end_reason,
+        "search_r1_num_searches": int(extra_info.get("search_r1_num_searches", 0)),
+        "search_r1_queries": [str(query) for query in extra_info.get("search_r1_queries", [])],
+    }
+    for reason in SEARCH_R1_END_REASONS:
+        info[f"search_r1_end_{reason}"] = float(end_reason == reason)
+    return info
+
 
 def normalize_answer(s):
     def remove_articles(text):
@@ -93,15 +120,16 @@ def count_answer_tags(text):
     return opening_tags, closing_tags
 
 
-def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
+def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0, extra_info=None):
     """The scoring function for exact match (EM).
 
     Args:
         solution_str: the solution text
         ground_truth: the ground truth
-        method: the method to extract the solution, choices are 'strict' and 'flexible'
+        method: the extraction method, choices are 'strict' and 'flexible'
         format_score: the score for the format
         score: the score for the correct answer
+        extra_info: optional agent-loop diagnostics (see :func:`_with_termination_info`)
     """
     answer = extract_solution(solution_str=solution_str)
     open_count, close_count = count_answer_tags(solution_str)
@@ -117,15 +145,15 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
         print(f"Solution string: {solution_str}")
 
     if answer is None:
-        return 0
+        return _with_termination_info(0, extra_info)
     else:
         if em_check(answer, ground_truth["target"]):
             if open_count > 10 or close_count > 10:  # prevent output a lot of </answer>
                 score = score / 4
-                return score
-            return score
+                return _with_termination_info(score, extra_info)
+            return _with_termination_info(score, extra_info)
         else:
-            return format_score
+            return _with_termination_info(format_score, extra_info)
 
 
 def compute_score_subem(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):

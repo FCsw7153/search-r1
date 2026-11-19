@@ -170,7 +170,7 @@ Search-R1（`PeterGriffinJin/Search-R1`）一致——`<think>` 推理、`<searc
   每轮 `stop=["</search>", "</answer>"]` 且 `include_stop_str_in_output=True`，停止标记
   本身保留在 response tokens 里（和 Search-R1 保留 `</search>` 一致）。
 
-用现有 launcher 加下面的 overrides 即可（1 卡；`VAL=sub` 验证更快）：
+用现有 launcher 加下面的 overrides 即可（1 卡、batch 128、800 步；`VAL=sub` 验证更快）：
 
 ```bash
 EXP=qwen3-4b-base-sr1 VAL=sub GPUS=0 BG=1 \
@@ -182,16 +182,24 @@ bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
   actor_rollout_ref.rollout.enable_prefix_caching=True \
   data.train_batch_size=128 \
   actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-  actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable
+  actor_rollout_ref.rollout.multi_turn.max_assistant_turns=5 \
+  actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable \
+  trainer.total_training_steps=800 \
+  trainer.rollout_data_dir=/home/work/rollouts/qwen3-4b-base-sr1/train \
+  trainer.validation_data_dir=/home/work/rollouts/qwen3-4b-base-sr1/val
 ```
 
 - 数据文件沿用 launcher 的默认值：`TRAIN_FILE=$SEARCH_R1_HOME/data/search_r1/train.parquet`，
   `VAL=sub` 时 `TEST_FILE=$SEARCH_R1_HOME/data/search_r1/test_sub.parquet`（可用同名环境变量覆盖）。
-- `multi_turn.tool_config_path` / `max_assistant_turns=4` / `max_tool_response_length=3000`
-  / `max_response_length=3072` 都沿用现有 recipe；`search_r1_agent` 直接使用其中名为
-  `search` 的工具（同一检索 URL 和 topk）。注意 `max_assistant_turns` 是**生成轮数**
-  （和 `tool_agent` 一致，最多 4 次 generation）；想复刻上游“4 轮检索 + 最后再生成一次
-  答案”的话把它设成 5。
+- `multi_turn.tool_config_path` / `max_tool_response_length=3000` / `max_response_length=3072`
+  都沿用现有 recipe；`search_r1_agent` 直接使用其中名为 `search` 的工具（同一检索 URL 和 topk）。
+  `max_assistant_turns` 是**生成轮数**（和 `tool_agent` 一致）。基线用 **5**：最多 4 轮
+  `<search>` + 最后再生成一次 `<answer>`，与上游 Search-R1 一致。
+- **最后一轮不再检索**：如果最后一次允许的 generation 仍以 `</search>` 结束，或者这次
+  generation 已用完 `max_response_length`，loop 直接结束，不再调用 retriever、也不追加
+  `<information>`（这些 token 只会被 mask 掉）。因此 `num_turns = user_turns +
+  assistant_turns + 1 <= 2 * max_assistant_turns`；此前 `max_assistant_turns=4` 时观察到
+  `num_turns/max=9` 的问题已修复。
 - `use_remove_padding=True` 对 Qwen3 的普通 attention 没问题（README 里的 `False` 是给
   Qwen3.5 GatedDeltaNet 的）。rmpad 下用 `ppo_max_token_len_per_gpu=24576` 的 token 预算。
 - `tokenization_sanity_check_mode=disable`：本 loop 不套 chat template，但只要配置了 tool
@@ -202,6 +210,47 @@ bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
   处理 EOS 即可；每轮显式设置上面两个 stop strings，所以不依赖 chat 结束符。
 - 单卡时 GPU0 默认还跑检索服务（`RETRIEVER_GPU=0`，~35GB），rollout 用
   `gpu_memory_utilization=0.6`；显存紧就把检索服务放到别的卡。
+
+### 每条轨迹的结束原因与检索统计
+
+`search_r1_agent` 为每条 trajectory 写三个 `extra_fields`（经 reward manager 的
+`tool_extra_fields` → `extra_info` 传到 `search_r1_like_qa_em.compute_score`，再放进
+`reward_extra_info`）：
+
+| extra_fields | 含义 |
+| --- | --- |
+| `search_r1_end_reason` | `answer` / `turn_cap` / `length` / `no_action` |
+| `search_r1_num_searches` | 实际执行的检索次数 |
+| `search_r1_queries` | 检索 query 列表（按执行顺序） |
+
+结束原因：`answer` = 以 `</answer>` 结束；`turn_cap` = 达到 `max_assistant_turns` 时还在
+检索；`length` = response token 预算耗尽；`no_action` = EOS / 没有 tag / tag 不完整。
+
+reward 返回的 dict 里另有 4 个 0/1 字段 `search_r1_end_{answer,turn_cap,length,no_action}`
+（均值就是占比）。数值字段在 logger 里聚合，字符串 `search_r1_end_reason` 和列表
+`search_r1_queries` 只进 dump（verl 的验证指标聚合会跳过非标量）。
+
+- **训练指标**（每个 step，console + `runs/<TS>.metrics.jsonl`）：V1 trainer 的
+  `_compute_metrics` 现在会读取每条样本 `extra_fields.reward_extra_info` 里的数值字段，
+  输出 `training/reward_extra/<key>/{mean,min,max}`，例如
+  `training/reward_extra/search_r1_end_turn_cap/mean`、
+  `training/reward_extra/search_r1_num_searches/mean`。原有的
+  `training/num_turns/{mean,max,min}`、`num_turns/{mean,max,min}` 仍然保留。
+- **验证指标**（每次验证）：走已有的 `val-aux/<data_source>/<key>/mean@N`，例如
+  `val-aux/searchR1_nq/search_r1_end_answer/mean@1`（`VAL=sub` 时每个 data_source 各自的
+  200 条；`n=1` 所以只有 `mean@1`）。
+- **rollout dump**（`trainer.rollout_data_dir`，V1 路径）：每个 step 一个
+  `<dir>/<global_step>.jsonl`，每行一条 trajectory：
+  `input`（decode 后的 Search-R1 prompt）、`output`（decode 后的 response，含
+  `<information>`）、`gts`、`score`（EM reward）、`step`、`uid`，以及
+  `reward_extra_info` 的所有 key（`acc`、`search_r1_end_reason`、
+  `search_r1_end_*`、`search_r1_num_searches`、`search_r1_queries`）。
+- **验证 dump**（`trainer.validation_data_dir`）：同样格式的 `<dir>/<global_step>.jsonl`，
+  每次验证写一份。
+- **大小**：800 步 × (128 prompts × `rollout.n=5`) = 512,000 条。单条约 5–8 KB
+  （prompt ~0.5 KB，response 最多 3072 tokens ≈ 12 KB），整轮训练 dump 约 3–4 GB；全部
+  trajectory 都接近长度上限时约 6–7 GB。放 pod 本地盘（`/home/work/rollouts/...`，pod
+  重建即清空），不要放共享盘。
 
 ## Checkpoint 放本地盘：CKPT_ROOT
 
