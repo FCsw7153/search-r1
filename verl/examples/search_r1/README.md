@@ -153,6 +153,56 @@ EXP=search-r1-001 BG=1 bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grp
     actor_rollout_ref.actor.optim.lr=5e-7
 ```
 
+## Qwen3-4B-Base：原始 Search-R1 tag 协议（search_r1_agent）
+
+Qwen3-4B-Base 是 base 模型，几乎不会输出 native `<tool_call>`（冒烟测试里约 0.15% 的
+trajectory），但会自然写 `<search>...</search>` / `<answer>...</answer>`。因此新增了
+`search_r1_agent`：纯文本 prompt（**不套 chat template**），协议与
+Search-R1（`PeterGriffinJin/Search-R1`）一致——`<think>` 推理、`<search> query </search>`
+检索、结果放进 `<information>...</information>`、最后 `<answer> ... </answer>`。
+
+- prompt 是上游 `scripts/data_process/nq_search.py` 里 `make_prefix(..., "base")` 模板的
+  逐字复刻；题目从现有 parquet `prompt` 的 user 消息里取，所以**不需要重新预处理数据**，
+  data_source 仍是 `searchR1_*`，`search_r1_like_qa_em` 的 EM reward 和验证指标不变。
+  prompt 里的示例 `<answer> Beijing </answer>` 只存在于 prompt tokens；reward manager 只
+  decode response（`data.batch["responses"]`，不含 prompt），不会匹配到它。
+- 检索信息以 token 形式追加进 response，`response_mask=0`（参与 attention、不进 loss）；
+  每轮 `stop=["</search>", "</answer>"]` 且 `include_stop_str_in_output=True`，停止标记
+  本身保留在 response tokens 里（和 Search-R1 保留 `</search>` 一致）。
+
+用现有 launcher 加下面的 overrides 即可（1 卡；`VAL=sub` 验证更快）：
+
+```bash
+EXP=qwen3-4b-base-sr1 VAL=sub GPUS=0 BG=1 \
+MODEL_PATH="$SEARCH_R1_HOME/data/models/Qwen3-4B-Base" \
+bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
+  actor_rollout_ref.rollout.agent.default_agent_loop=search_r1_agent \
+  actor_rollout_ref.model.use_remove_padding=True \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
+  actor_rollout_ref.rollout.enable_prefix_caching=True \
+  data.train_batch_size=128 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+  actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable
+```
+
+- 数据文件沿用 launcher 的默认值：`TRAIN_FILE=$SEARCH_R1_HOME/data/search_r1/train.parquet`，
+  `VAL=sub` 时 `TEST_FILE=$SEARCH_R1_HOME/data/search_r1/test_sub.parquet`（可用同名环境变量覆盖）。
+- `multi_turn.tool_config_path` / `max_assistant_turns=4` / `max_tool_response_length=3000`
+  / `max_response_length=3072` 都沿用现有 recipe；`search_r1_agent` 直接使用其中名为
+  `search` 的工具（同一检索 URL 和 topk）。注意 `max_assistant_turns` 是**生成轮数**
+  （和 `tool_agent` 一致，最多 4 次 generation）；想复刻上游“4 轮检索 + 最后再生成一次
+  答案”的话把它设成 5。
+- `use_remove_padding=True` 对 Qwen3 的普通 attention 没问题（README 里的 `False` 是给
+  Qwen3.5 GatedDeltaNet 的）。rmpad 下用 `ppo_max_token_len_per_gpu=24576` 的 token 预算。
+- `tokenization_sanity_check_mode=disable`：本 loop 不套 chat template，但只要配置了 tool
+  config，worker 仍会对 `tool_agent` 跑一次 chat-template sanity check；这一步与本 loop
+  无关，关掉即可。
+- 停止与 EOS：Qwen3-4B-Base 的 `generation_config.json` 里 eos 只有 `<|endoftext|>`
+  （151643）。本 loop 用纯文本 prompt、不套 chat template，vLLM 按 generation config
+  处理 EOS 即可；每轮显式设置上面两个 stop strings，所以不依赖 chat 结束符。
+- 单卡时 GPU0 默认还跑检索服务（`RETRIEVER_GPU=0`，~35GB），rollout 用
+  `gpu_memory_utilization=0.6`；显存紧就把检索服务放到别的卡。
+
 ## Checkpoint 放本地盘：CKPT_ROOT
 
 checkpoint 是 FSDP 模型 + fp32 optimizer，每个 25GB（4 rank），写共享盘很慢。设置
