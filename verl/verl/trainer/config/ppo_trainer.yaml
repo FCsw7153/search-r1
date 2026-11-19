@@ -80,6 +80,28 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Stratified GRPO (adv_estimator=stratified_grpo): blend SAN with the group GRPO advantage.
+  # alpha=0 is exactly GRPO; 0.6 is the paper's Qwen2.5-3B Base setting (Instruct uses 0.8).
+  stratified_grpo_alpha: 0.6
+  stratified_grpo_epsilon: 1.0e-6
+  # The paper's Algorithm 1 uses a population std; False keeps verl GRPO's sample std so a
+  # single-stratum batch is exactly GRPO. Set True for the paper's exact convention.
+  stratified_grpo_population_std: False
+
+  # GCA (adv_estimator=gca): grounded credit assignment over search/answer segments.
+  gca_eta: 0.2
+  gca_lambda_max: 1.0
+  gca_c_max: 0.5
+  gca_correction_cap: 0.1
+  gca_temperature: 0.5
+  gca_top_k: 3
+  gca_top_m: 32
+  gca_alpha: 0.6
+  gca_beta: 0.3
+  gca_gamma: 0.1
+  gca_salience_mode: approx
+  gca_assume_retrievable: True
+
   # Group filtering configuration used by DAPO and entropy-based sampling
   filter_groups:
 

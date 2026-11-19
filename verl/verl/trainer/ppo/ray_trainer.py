@@ -245,8 +245,45 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator in (AdvantageEstimator.STRATIFIED_GRPO, AdvantageEstimator.GCA):
+        # Search-R1 group-relative estimators: both need the per-trajectory search structure
+        # recorded by search_r1_agent in non_tensor_batch.
+        adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
+        if "uid" not in data.non_tensor_batch:
+            raise ValueError(f"{adv_estimator} requires the prompt-group uid in non_tensor_batch")
+        if "search_r1_num_searches" not in data.non_tensor_batch:
+            raise ValueError(
+                f"{adv_estimator} requires non_tensor_batch['search_r1_num_searches']; "
+                "set actor_rollout_ref.rollout.agent.default_agent_loop=search_r1_agent."
+            )
+        adv_metrics: dict[str, Any] = {}
+        adv_kwargs = {
+            "token_level_rewards": data.batch["token_level_rewards"],
+            "response_mask": data.batch["response_mask"],
+            "index": data.non_tensor_batch["uid"],
+            "num_searches": data.non_tensor_batch["search_r1_num_searches"],
+            "norm_adv_by_std_in_grpo": norm_adv_by_std_in_grpo,
+            "config": config,
+            "metrics": adv_metrics,
+        }
+        if adv_estimator == AdvantageEstimator.GCA:
+            for field, kwarg in (
+                ("search_r1_hit", "hit"),
+                ("search_r1_first_hit_turn", "first_hit_turn"),
+                ("search_r1_has_answer", "has_answer"),
+            ):
+                if field in data.non_tensor_batch:
+                    adv_kwargs[kwarg] = data.non_tensor_batch[field]
+            if "old_log_probs" in data.batch:
+                adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
+            if "entropy" in data.batch:
+                adv_kwargs["entropy"] = data.batch["entropy"]
+        advantages, returns = adv_estimator_fn(**adv_kwargs)
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        if adv_metrics:
+            data.meta_info["adv_estimator_metrics"] = adv_metrics
     else:
-        # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
         adv_kwargs = {
             "token_level_rewards": data.batch["token_level_rewards"],

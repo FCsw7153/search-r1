@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -96,6 +97,8 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    STRATIFIED_GRPO = "stratified_grpo"
+    GCA = "gca"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -356,6 +359,468 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+def _adv_config_value(config: Optional[AlgoConfig], key: str, default: Any) -> Any:
+    """Read an optional estimator hyperparameter from a DictConfig / dataclass / dict."""
+    if config is None:
+        return default
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return getattr(config, key, default)
+
+
+def _group_scalar_advantages(
+    scores: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float,
+    norm_adv_by_std: bool,
+    population_std: bool = False,
+) -> torch.Tensor:
+    """Per-trajectory GRPO advantage.
+
+    By default this matches :func:`compute_grpo_outcome_advantage` exactly (sample std,
+    singleton-group fallback of mean=0/std=1). ``population_std=True`` switches to the
+    population std used by Stratified GRPO's Algorithm 1.
+    """
+    id2scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
+    for i in range(scores.shape[0]):
+        id2scores[index[i]].append(scores[i])
+
+    id2mean: dict[Any, torch.Tensor] = {}
+    id2std: dict[Any, torch.Tensor] = {}
+    for idx, group_scores in id2scores.items():
+        if len(group_scores) == 1:
+            id2mean[idx] = torch.zeros((), device=scores.device, dtype=scores.dtype)
+            id2std[idx] = torch.ones((), device=scores.device, dtype=scores.dtype)
+        else:
+            stacked = torch.stack(group_scores)
+            id2mean[idx] = torch.mean(stacked)
+            id2std[idx] = torch.std(stacked, unbiased=not population_std)
+
+    advantages = torch.empty_like(scores)
+    for i in range(scores.shape[0]):
+        if norm_adv_by_std:
+            advantages[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+        else:
+            advantages[i] = scores[i] - id2mean[index[i]]
+    return advantages
+
+
+def _response_runs(response_mask_row: torch.Tensor) -> list[tuple[int, int]]:
+    """Split one response into contiguous ``response_mask == 1`` runs, as ``[start, end)``.
+
+    Search-R1 appends every information block with ``response_mask = 0``, so each run is exactly
+    one assistant generation (turn). Padding is also 0 and therefore never forms a run.
+    """
+    runs: list[tuple[int, int]] = []
+    start: Optional[int] = None
+    for position, value in enumerate(response_mask_row.tolist()):
+        if value and start is None:
+            start = position
+        elif not value and start is not None:
+            runs.append((start, position))
+            start = None
+    if start is not None:
+        runs.append((start, len(response_mask_row)))
+    return runs
+
+
+@register_adv_est(AdvantageEstimator.STRATIFIED_GRPO)
+def compute_stratified_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    num_searches: Optional[np.ndarray] = None,
+    epsilon: float = 1e-6,
+    alpha: float = 0.6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    metrics: Optional[dict[str, Any]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stratified GRPO (Zhu et al., arXiv 2510.06214, Algorithm 1).
+
+    Trajectories are stratified **within each prompt group** by their number of executed search
+    calls (``search_r1_num_searches``), and the stratum-local advantage is
+
+        A_SAN(tau_i) = (R(tau_i) - mean_k) / (std_k + epsilon)        # Eq. (2)
+
+    with a stratum-local standard deviation (Algorithm 1 uses a population std; see the note
+    below). The final advantage linearly blends SAN with the prompt-group GRPO advantage A_GN
+    (Eq. 7):
+
+        A_blend = alpha * A_SAN + (1 - alpha) * A_GN.
+
+    ``alpha=0`` reproduces plain GRPO exactly. Small and singleton strata need no special rule:
+    a singleton (or zero-variance) stratum has SAN = 0 and therefore falls back to
+    ``(1 - alpha) * A_GN``; the paper's only finite-sample remedy is the blend itself.
+
+    Notes:
+        - ``epsilon`` is not fixed by the paper; the default matches verl's GRPO (1e-6).
+        - ``alpha`` defaults to 0.6, the paper's Qwen2.5-3B **Base** setting (their Qwen2.5-3B
+          Instruct setting is 0.8). ``norm_adv_by_std_in_grpo`` controls std scaling for both
+          A_GN and A_SAN, exactly as the config does for GRPO.
+        - Algorithm 1 uses a population std (``unbiased=False``). We default to verl GRPO's
+          sample std instead, so a batch whose trajectories all share one stratum is exactly
+          GRPO; set ``stratified_grpo_population_std=true`` for the paper's exact convention.
+    """
+    epsilon = float(_adv_config_value(config, "stratified_grpo_epsilon", epsilon))
+    alpha = float(_adv_config_value(config, "stratified_grpo_alpha", alpha))
+    population_std = bool(_adv_config_value(config, "stratified_grpo_population_std", False))
+    norm_adv_by_std_in_grpo = bool(
+        _adv_config_value(config, "norm_adv_by_std_in_grpo", norm_adv_by_std_in_grpo)
+    )
+    if num_searches is None:
+        raise ValueError(
+            "stratified_grpo requires search_r1_num_searches in non_tensor_batch; use the "
+            "search_r1_agent agent loop or provide the field explicitly."
+        )
+    if alpha < 0.0 or alpha > 1.0:
+        raise ValueError(f"stratified_grpo alpha must be in [0, 1], got {alpha}")
+
+    scores = token_level_rewards.sum(dim=-1)
+    searches = [int(value) for value in num_searches]
+    if len(searches) != scores.shape[0]:
+        raise ValueError(f"num_searches has {len(searches)} rows but scores has {scores.shape[0]}")
+
+    with torch.no_grad():
+        global_adv = _group_scalar_advantages(
+            scores, index, epsilon, norm_adv_by_std_in_grpo, population_std=population_std
+        )
+        san_adv = torch.zeros_like(global_adv)
+
+        # group uid -> stratum key (search count) -> row indices
+        id2strata: dict[Any, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
+        for i in range(scores.shape[0]):
+            id2strata[index[i]][searches[i]].append(i)
+
+        num_strata = 0
+        num_singleton = 0
+        zero_san = 0
+        for strata in id2strata.values():
+            for row_indices in strata.values():
+                num_strata += 1
+                if len(row_indices) == 1:
+                    num_singleton += 1
+                stratum_scores = scores[row_indices]
+                if len(row_indices) > 1:
+                    mean = torch.mean(stratum_scores)
+                    std = torch.std(stratum_scores, unbiased=not population_std)
+                else:
+                    # mean == score and std == 0; SAN is exactly zero for a singleton.
+                    mean = stratum_scores[0]
+                    std = torch.zeros((), device=scores.device, dtype=scores.dtype)
+                if float(std) == 0.0:
+                    zero_san += len(row_indices)
+                for row_index in row_indices:
+                    if norm_adv_by_std_in_grpo:
+                        san_adv[row_index] = (scores[row_index] - mean) / (std + epsilon)
+                    else:
+                        san_adv[row_index] = scores[row_index] - mean
+
+        blended = alpha * san_adv + (1.0 - alpha) * global_adv
+        advantages = blended.unsqueeze(-1) * response_mask
+
+    if metrics is not None:
+        bsz = max(scores.shape[0], 1)
+        num_groups = max(len(id2strata), 1)
+        metrics.update(
+            {
+                "training/adv_estimator/stratified_grpo/alpha": float(alpha),
+                "training/adv_estimator/stratified_grpo/num_strata": float(num_strata / num_groups),
+                "training/adv_estimator/stratified_grpo/mean_stratum_size": float(
+                    bsz / num_strata if num_strata else 0.0
+                ),
+                "training/adv_estimator/stratified_grpo/singleton_strata_frac": float(
+                    num_singleton / max(num_strata, 1)
+                ),
+                "training/adv_estimator/stratified_grpo/zero_san_traj_frac": float(zero_san / bsz),
+            }
+        )
+    return advantages, advantages
+
+
+# GCA routing table (arXiv 2610.23148, Tables 1 and 9). Each entry is
+# (polarity P, magnitude lambda, salience branch): "+" -> c+, "-" -> c-, None -> no correction.
+_GCA_ROUTING: dict[str, dict[str, tuple[float, float, Optional[str]]]] = {
+    "A": {"vsearch": (1.0, 0.5, "+"), "rsearch": (-1.0, 0.1, "-"), "ans": (1.0, 1.0, "+")},
+    "B1": {"vsearch": (1.0, 0.5, "+"), "rsearch": (-1.0, 0.2, "-"), "ans": (-1.0, 1.0, "-")},
+    "B2": {"vsearch": (1.0, 0.5, "+"), "rsearch": (-1.0, 0.1, "-"), "ans": (0.0, 0.0, None)},
+    "C": {},
+    "D1": {"rsearch": (-1.0, 0.2, "-"), "ans": (-1.0, 0.1, "-")},
+    "D0": {},
+}
+
+
+def _gca_segment_salience(
+    log_probs: Optional[torch.Tensor],
+    entropy: Optional[torch.Tensor],
+    start: int,
+    end: int,
+    *,
+    top_k: int,
+    top_m: int,
+    tau: float,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    c_max: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token salience ``c+`` / ``c-`` for one segment (GCA Section 4.3, Eqs. 5-6).
+
+    The paper defines the sampled-token margin against the mean top-K probability and the
+    entropy of the renormalized top-M distribution. Those distributions are not carried by
+    verl's advantage path (it has only the sampled-token log-prob and the actor's entropy), so
+    the default approximation is
+
+        delta_t = log pi_old(y_t) + log K        (uniform top-K reference)
+        Hhat_t  = entropy_t / log M              (clamped to [0, 1])
+
+    followed by the paper's segment-median centering and Eqs. (5)-(6). When ``log_probs`` or
+    ``entropy`` is unavailable (e.g. bypass-mode log-probs), it falls back to the constant
+    ``c = c_max``; this preserves the 10% cap and the no-sign-flip guarantee either way.
+    """
+    length = end - start
+    if log_probs is None or entropy is None or length == 0:
+        constant = torch.full((length,), float(c_max), dtype=torch.float32, device=device)
+        return constant, constant
+
+    log_probs_segment = log_probs[start:end].float()
+    entropy_segment = entropy[start:end].float()
+    hhat = (entropy_segment / math.log(max(top_m, 2))).clamp(0.0, 1.0)
+    # Uniform top-K reference: peaked distributions (high p) get a positive margin, flat ones ~0.
+    delta = log_probs_segment + math.log(max(top_k, 2))
+    delta_centered = delta - delta.median()
+    d_pos = torch.sigmoid(-delta_centered / tau)
+    d_neg = torch.sigmoid(delta_centered / tau)
+    c_pos = alpha * d_pos + beta * hhat + gamma * d_pos * hhat
+    c_neg = alpha * d_neg + beta * (1.0 - hhat) + gamma * d_neg * (1.0 - hhat)
+    return c_pos.clamp(0.0, c_max), c_neg.clamp(0.0, c_max)
+
+
+@register_adv_est(AdvantageEstimator.GCA)
+def compute_gca_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    num_searches: Optional[np.ndarray] = None,
+    hit: Optional[np.ndarray] = None,
+    first_hit_turn: Optional[np.ndarray] = None,
+    has_answer: Optional[np.ndarray] = None,
+    old_log_probs: Optional[torch.Tensor] = None,
+    entropy: Optional[torch.Tensor] = None,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    metrics: Optional[dict[str, Any]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Grounded Credit Assignment (arXiv 2610.23148, Algorithm 1).
+
+    Two verifiable sub-outcomes per trajectory:
+
+        H_i  = any retrieved document contains a gold alias as a case-insensitive substring
+        k_i* = first search turn where that happens
+        C_i  = outcome correctness (the EM reward is positive; Search-R1 returns 1.0, or 0.25
+               for an over-tagged answer, so ``score > 0`` is the practical EM flag)
+
+    Rollouts are typed as A (H,C), B1 (H, wrong valid answer), B2 (H, timeout/no valid answer),
+    C (no H, wrong) or D1/D0 (no H, correct, retrievable/non-retrievable). The GRPO advantage
+    ``A_hat`` is corrected per token:
+
+        A_token = A_hat + e * eta * |A_hat| * P_{T,S} * lambda_{T,S} * c_t      # Eq. (4)
+
+    where S(t) is vSearch (search turns up to k_i*), rSearch (later/all no-hit searches) or Ans
+    (the terminal answer turn), and (P, lambda) come from Tables 1/9. The correction is clamped
+    to ``gca_correction_cap * |A_hat|`` (0.1 at the paper's defaults), so it can never flip the
+    sign or move a token into a different PPO clipping branch.
+
+    Choices made where the paper assumes information verl does not have:
+        - ``Retr(x)`` needs an oracle retrieval over gold aliases. We only know whether any
+          rollout in the prompt group hit. If none did, we default to ``Retr=1`` (D1) and expose
+          ``gca_assume_retrievable=false`` to instead treat such rollouts as D0 (zeroed
+          advantage; KL loss cannot be masked from here).
+        - Salience uses the approximation documented in :func:`_gca_segment_salience`; set
+          ``gca_salience_mode=constant`` to use ``c = c_max`` directly.
+        - The paper excludes eight structural-tag literals. The advantage path has no tokenizer,
+          so tag tokens are not excluded; the cap/sign guarantees are unaffected.
+        - ``has_answer`` marks a trajectory that ended with a valid ``</answer>``; without it we
+          assume every terminal turn is a valid answer.
+    """
+    eta = float(_adv_config_value(config, "gca_eta", 0.2))
+    lambda_max = float(_adv_config_value(config, "gca_lambda_max", 1.0))
+    c_max = float(_adv_config_value(config, "gca_c_max", 0.5))
+    correction_cap = float(_adv_config_value(config, "gca_correction_cap", 0.1))
+    tau = float(_adv_config_value(config, "gca_temperature", 0.5))
+    top_k = int(_adv_config_value(config, "gca_top_k", 3))
+    top_m = int(_adv_config_value(config, "gca_top_m", 32))
+    alpha = float(_adv_config_value(config, "gca_alpha", 0.6))
+    beta = float(_adv_config_value(config, "gca_beta", 0.3))
+    gamma = float(_adv_config_value(config, "gca_gamma", 0.1))
+    salience_mode = str(_adv_config_value(config, "gca_salience_mode", "approx"))
+    assume_retrievable = bool(_adv_config_value(config, "gca_assume_retrievable", True))
+    norm_adv_by_std_in_grpo = bool(
+        _adv_config_value(config, "norm_adv_by_std_in_grpo", norm_adv_by_std_in_grpo)
+    )
+
+    if num_searches is None or hit is None or first_hit_turn is None:
+        raise ValueError(
+            "gca requires search_r1_num_searches, search_r1_hit and search_r1_first_hit_turn "
+            "in non_tensor_batch; use the search_r1_agent agent loop."
+        )
+    if salience_mode not in ("approx", "constant"):
+        raise ValueError(f"gca_salience_mode must be 'approx' or 'constant', got {salience_mode!r}")
+    if eta < 0.0 or c_max < 0.0 or correction_cap < 0.0:
+        raise ValueError("gca eta, c_max and correction_cap must be non-negative")
+    if tau <= 0.0:
+        raise ValueError(f"gca_temperature must be positive, got {tau}")
+
+    scores = token_level_rewards.sum(dim=-1)
+    bsz = scores.shape[0]
+    searches = [int(value) for value in num_searches]
+    hits = [int(value) for value in hit]
+    first_hits = [int(value) for value in first_hit_turn]
+    answers = [int(value) for value in (has_answer if has_answer is not None else [1] * bsz)]
+    if not (len(searches) == len(hits) == len(first_hits) == len(answers) == bsz):
+        raise ValueError("GCA per-trajectory fields must have one value per batch row")
+
+    use_token_salience = salience_mode == "approx" and old_log_probs is not None and entropy is not None
+    if use_token_salience:
+        if old_log_probs.shape != response_mask.shape or entropy.shape != response_mask.shape:
+            raise ValueError(
+                "gca old_log_probs/entropy must be response-aligned; "
+                f"got {tuple(old_log_probs.shape)} / {tuple(entropy.shape)} vs {tuple(response_mask.shape)}"
+            )
+
+    type_counts = {name: 0 for name in ("A", "B1", "B2", "C", "D1", "D0")}
+    zero_var_groups: set[Any] = set()
+    group_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
+    group_has_hit: dict[Any, bool] = defaultdict(bool)
+    for i in range(bsz):
+        group_scores[index[i]].append(scores[i])
+        group_has_hit[index[i]] = group_has_hit[index[i]] or bool(hits[i])
+    for group_id, values in group_scores.items():
+        if len(values) == 1:
+            zero_var_groups.add(group_id)
+        elif float(torch.stack(values).std(unbiased=False)) <= epsilon:
+            zero_var_groups.add(group_id)
+
+    with torch.no_grad():
+        base_adv = _group_scalar_advantages(scores, index, epsilon, norm_adv_by_std_in_grpo)
+        advantages = base_adv.unsqueeze(-1) * response_mask
+
+        corrected_trajectories = 0
+        skipped_zero_var = 0
+        correction_abs_sum = 0.0
+        correction_ratio_sum = 0.0
+        correction_count = 0
+        salience_sum = 0.0
+        salience_count = 0
+
+        for i in range(bsz):
+            has_hit = bool(hits[i])
+            correct = bool(scores[i] > 0)
+            valid_answer = bool(answers[i])
+            if has_hit and correct:
+                trajectory_type = "A"
+            elif has_hit:
+                trajectory_type = "B1" if valid_answer else "B2"
+            elif correct:
+                retrievable = bool(group_has_hit[index[i]]) or assume_retrievable
+                trajectory_type = "D1" if retrievable else "D0"
+            else:
+                trajectory_type = "C"
+            type_counts[trajectory_type] += 1
+
+            if trajectory_type == "C":
+                continue
+            if trajectory_type == "D0":
+                # The paper masks type-D/non-retrievable rollouts from the policy loss. We cannot
+                # change response_mask here, so zero the advantage: no policy-gradient signal.
+                advantages[i].zero_()
+                continue
+            if index[i] in zero_var_groups:
+                skipped_zero_var += 1
+                continue
+
+            runs = _response_runs(response_mask[i])
+            num_search_turns = searches[i]
+            first_hit = first_hits[i]
+            if has_hit and first_hit < 1:
+                # Defensive: a hit with an unknown first turn still implies the first search turn.
+                first_hit = 1
+            routing = _GCA_ROUTING[trajectory_type]
+            abs_base = float(base_adv[i].abs())
+            if abs_base == 0.0:
+                continue
+
+            corrected = False
+            for run_index, (start, end) in enumerate(runs):
+                if run_index < num_search_turns:
+                    if has_hit and run_index + 1 <= first_hit:
+                        segment = "vsearch"
+                    else:
+                        segment = "rsearch"
+                elif run_index == num_search_turns:
+                    segment = "ans"
+                else:
+                    continue
+                coefficients = routing.get(segment)
+                if coefficients is None:
+                    continue
+                polarity, magnitude, branch = coefficients
+                if polarity == 0.0 or magnitude == 0.0 or branch is None:
+                    continue
+                magnitude = min(magnitude, lambda_max)
+                c_pos, c_neg = _gca_segment_salience(
+                    old_log_probs[i] if use_token_salience else None,
+                    entropy[i] if use_token_salience else None,
+                    start,
+                    end,
+                    top_k=top_k,
+                    top_m=top_m,
+                    tau=tau,
+                    alpha=alpha,
+                    beta=beta,
+                    gamma=gamma,
+                    c_max=c_max,
+                    device=response_mask.device,
+                )
+                salience = c_pos if polarity > 0 else c_neg
+                residual = eta * abs_base * polarity * magnitude * salience
+                cap = correction_cap * abs_base
+                residual = residual.clamp(-cap, cap)
+                advantages[i, start:end] += residual
+                corrected = True
+                correction_abs_sum += float(residual.abs().sum())
+                correction_ratio_sum += float((residual.abs() / abs_base).sum())
+                correction_count += residual.numel()
+                salience_sum += float(salience.sum())
+                salience_count += salience.numel()
+            corrected_trajectories += int(corrected)
+        advantages = advantages * response_mask
+
+    if metrics is not None:
+        denom = max(bsz, 1)
+        for name, count in type_counts.items():
+            metrics[f"training/adv_estimator/gca/type_{name.lower()}_frac"] = float(count / denom)
+        metrics.update(
+            {
+                "training/adv_estimator/gca/corrected_traj_frac": float(corrected_trajectories / denom),
+                "training/adv_estimator/gca/skipped_zero_var_frac": float(skipped_zero_var / denom),
+                "training/adv_estimator/gca/mean_abs_correction": float(
+                    correction_abs_sum / max(correction_count, 1)
+                ),
+                "training/adv_estimator/gca/mean_abs_correction_ratio": float(
+                    correction_ratio_sum / max(correction_count, 1)
+                ),
+                "training/adv_estimator/gca/mean_salience": float(
+                    salience_sum / max(salience_count, 1)
+                ),
+            }
+        )
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")

@@ -22,6 +22,17 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import compute_advantage
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
 
+# Outcome/group-relative estimators treat each agent session as one trajectory and broadcast
+# the result to every partial output of that session. GAE and the token-level estimators are
+# delegated to the original compute_advantage() unchanged.
+_GROUP_RELATIVE_ADV_ESTIMATORS = {"grpo", "stratified_grpo", "gca"}
+
+
+def _adv_estimator_name(adv_estimator) -> str:
+    if isinstance(adv_estimator, core_algos.AdvantageEstimator):
+        return adv_estimator.value
+    return str(adv_estimator)
+
 
 class MetricsAggregator:
     """
@@ -165,7 +176,7 @@ def compute_advantage_for_multi_trajectories(
     in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
     original ``compute_advantage()`` unchanged.
     """
-    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+    if _adv_estimator_name(adv_estimator) not in _GROUP_RELATIVE_ADV_ESTIMATORS:
         return compute_advantage(
             data,
             adv_estimator=adv_estimator,
@@ -206,6 +217,18 @@ def compute_advantage_for_multi_trajectories(
         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         config=config,
     )
+    if "adv_estimator_metrics" in final_data.meta_info:
+        data.meta_info["adv_estimator_metrics"] = final_data.meta_info["adv_estimator_metrics"]
+
+    # GCA has per-token advantages inside each trajectory; keep the full final-session rows
+    # instead of broadcasting the first token's scalar.
+    if _adv_estimator_name(adv_estimator) == "gca":
+        final_advantages = final_data.batch["advantages"]
+        advantages = final_advantages[row_to_local_index] * data.batch["response_mask"]
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = advantages
+        return data
+
     first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
     final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
 

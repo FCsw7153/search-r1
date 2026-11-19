@@ -42,6 +42,11 @@ def _with_termination_info(score_value, extra_info):
         "search_r1_num_searches": int(extra_info.get("search_r1_num_searches", 0)),
         "search_r1_queries": [str(query) for query in extra_info.get("search_r1_queries", [])],
     }
+    # GCA evidence diagnostics (arXiv 2610.23148, Eq. 1). They are forwarded to the advantage
+    # estimator through the same extra_fields path and also show up in the metrics and dump.
+    for key in ("search_r1_hit", "search_r1_first_hit_turn", "search_r1_has_answer"):
+        if key in extra_info:
+            info[key] = int(extra_info[key])
     for reason in SEARCH_R1_END_REASONS:
         info[f"search_r1_end_{reason}"] = float(end_reason == reason)
     return info

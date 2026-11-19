@@ -1897,7 +1897,23 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        adv_estimator_value = self.config.algorithm.adv_estimator
+        adv_estimator_name = (
+            adv_estimator_value.value if hasattr(adv_estimator_value, "value") else str(adv_estimator_value)
+        )
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob"]
+        if adv_estimator_name in ("stratified_grpo", "gca"):
+            # search_r1_agent writes its per-trajectory diagnostics into extra_fields, which is
+            # stored as one nested dict per row in TransferQueue (not as top-level fields).
+            fields.append("extra_fields")
+        if adv_estimator_name == "gca":
+            # GCA's token salience uses the actor's per-token entropy. Bypass mode skips
+            # _compute_old_log_prob entirely, so entropy may not exist there; the estimator then
+            # falls back to the constant-salience branch.
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+            if not bypass_recomputing_logprobs:
+                fields.append("entropy")
         if self.use_critic:
             fields.append("values")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
@@ -1906,6 +1922,33 @@ class PPOTrainer(ABC):
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        if adv_estimator_name in ("stratified_grpo", "gca"):
+            extra_rows = data.batch.pop("extra_fields").tolist()
+
+            def extra_value(row, key, default):
+                value = row.get(key) if isinstance(row, dict) else None
+                if value is None and isinstance(row, dict):
+                    value = (row.get("reward_extra_info") or {}).get(key)
+                return default if value is None else value
+
+            data.non_tensor_batch["search_r1_num_searches"] = np.asarray(
+                [extra_value(row, "search_r1_num_searches", -1) for row in extra_rows], dtype=np.int64
+            )
+            if np.any(data.non_tensor_batch["search_r1_num_searches"] < 0):
+                raise ValueError(
+                    f"{adv_estimator_name} requires search_r1_num_searches for every trajectory; "
+                    "set actor_rollout_ref.rollout.agent.default_agent_loop=search_r1_agent."
+                )
+            if adv_estimator_name == "gca":
+                data.non_tensor_batch["search_r1_hit"] = np.asarray(
+                    [extra_value(row, "search_r1_hit", 0) for row in extra_rows], dtype=np.int64
+                )
+                data.non_tensor_batch["search_r1_first_hit_turn"] = np.asarray(
+                    [extra_value(row, "search_r1_first_hit_turn", -1) for row in extra_rows], dtype=np.int64
+                )
+                data.non_tensor_batch["search_r1_has_answer"] = np.asarray(
+                    [extra_value(row, "search_r1_has_answer", 1) for row in extra_rows], dtype=np.int64
+                )
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1939,6 +1982,7 @@ class PPOTrainer(ABC):
             norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
             config=self.config.algorithm,
         )
+        metrics.update(data.meta_info.pop("adv_estimator_metrics", {}))
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]

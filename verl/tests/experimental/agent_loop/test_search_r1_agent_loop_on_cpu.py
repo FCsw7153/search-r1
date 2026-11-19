@@ -27,8 +27,10 @@ from verl.experimental.agent_loop.search_r1_agent_loop import (
     SEARCH_R1_BASE_TEMPLATE,
     SearchR1AgentLoop,
     build_search_r1_prompt,
+    extract_gold_answers,
     extract_question,
     parse_search_r1_action,
+    response_contains_gold_alias,
 )
 from verl.tools.schemas import ToolResponse
 from verl.utils.reward_score import search_r1_like_qa_em
@@ -113,6 +115,18 @@ class FailingSearchTool(FakeSearchTool):
         raise RuntimeError("retriever down")
 
 
+class ScriptedSearchTool(FakeSearchTool):
+    """Returns one scripted document string per query."""
+
+    def __init__(self, texts):
+        super().__init__()
+        self.texts = list(texts)
+
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.queries.append(parameters["query"])
+        return ToolResponse(text=self.texts.pop(0)), 0.0, {"search_calls": 1}
+
+
 def _find_subsequence(haystack, needle):
     for start in range(len(haystack) - len(needle) + 1):
         if haystack[start : start + len(needle)] == needle:
@@ -183,6 +197,21 @@ class TestSearchR1Helpers(unittest.TestCase):
         entry = _agent_loop_registry["search_r1_agent"]
         assert entry["_target_"].endswith("SearchR1AgentLoop")
 
+    def test_extract_gold_answers(self):
+        assert extract_gold_answers({"ground_truth": {"target": ["Paris", " paris "]}}) == ["Paris", " paris "]
+        assert extract_gold_answers({"ground_truth": {"target": "Paris"}}) == ["Paris"]
+        assert extract_gold_answers({"ground_truth": "Paris"}) == ["Paris"]
+        assert extract_gold_answers({"ground_truth": {"target": []}}) == []
+        assert extract_gold_answers({"ground_truth": {"target": [None, "  "]}}) == []
+        assert extract_gold_answers(None) == []
+
+    def test_response_contains_gold_alias_is_case_insensitive_substring(self):
+        assert response_contains_gold_alias("Doc: PARIS is the capital", ["  paris  "])
+        assert response_contains_gold_alias("Doc: parisian", ["Paris"])
+        assert not response_contains_gold_alias("Doc: London", ["Paris"])
+        assert not response_contains_gold_alias("anything", [])
+        assert not response_contains_gold_alias("anything", ["   "])
+
 
 class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -247,6 +276,87 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
         assert output.extra_fields["search_r1_end_reason"] == "answer"
         assert output.extra_fields["search_r1_num_searches"] == 1
         assert output.extra_fields["search_r1_queries"] == ["capital of France"]
+
+    async def test_hit_fields_for_grounded_trajectory(self):
+        tool = FakeSearchTool(text="Doc 1: Paris is the capital of France.")
+        turns = [
+            "<think>I should search.</think><search> capital of France </search>",
+            "<think>The result says Paris.</think><answer> Paris </answer>",
+        ]
+        server = FakeLLMServer(self.tokenizer, turns)
+        loop = _make_loop(self.tokenizer, server, tool)
+
+        output = await loop.run(
+            {"logprobs": False},
+            raw_prompt=RAW_PROMPT,
+            reward_model={"style": "rule", "ground_truth": {"target": ["Paris"]}},
+        )
+
+        assert output.extra_fields["search_r1_hit"] == 1
+        assert output.extra_fields["search_r1_first_hit_turn"] == 1
+        assert output.extra_fields["search_r1_has_answer"] == 1
+        assert output.extra_fields["search_r1_num_searches"] == 1
+
+    async def test_hit_on_second_search_turn(self):
+        tool = ScriptedSearchTool(["Doc: London is a city.", "Doc: Paris is the capital."])
+        turns = [
+            "<think>search one</think><search> q1 </search>",
+            "<think>search two</think><search> q2 </search>",
+            "<think>found it</think><answer> Paris </answer>",
+        ]
+        server = FakeLLMServer(self.tokenizer, turns)
+        loop = _make_loop(self.tokenizer, server, tool)
+
+        output = await loop.run(
+            {"logprobs": False},
+            raw_prompt=RAW_PROMPT,
+            reward_model={"ground_truth": {"target": ["Paris"]}},
+        )
+
+        assert output.extra_fields["search_r1_num_searches"] == 2
+        assert output.extra_fields["search_r1_hit"] == 1
+        assert output.extra_fields["search_r1_first_hit_turn"] == 2
+        assert output.extra_fields["search_r1_has_answer"] == 1
+
+    async def test_no_hit_and_no_gold_answers(self):
+        turns = [
+            "<think>search</think><search> q </search>",
+            "<think>wrong</think><answer> Berlin </answer>",
+        ]
+        # Gold answers available but never retrieved: hit=0, first_hit=-1.
+        server = FakeLLMServer(self.tokenizer, turns)
+        loop = _make_loop(self.tokenizer, server, FakeSearchTool(text="Doc: London."))
+        output = await loop.run(
+            {"logprobs": False},
+            raw_prompt=RAW_PROMPT,
+            reward_model={"ground_truth": {"target": ["Paris"]}},
+        )
+        assert output.extra_fields["search_r1_hit"] == 0
+        assert output.extra_fields["search_r1_first_hit_turn"] == -1
+
+        # No reward_model in kwargs: the diagnostics keep their defaults instead of crashing.
+        server = FakeLLMServer(self.tokenizer, turns)
+        loop = _make_loop(self.tokenizer, server, FakeSearchTool(text="Doc: Paris."))
+        output = await loop.run({"logprobs": False}, raw_prompt=RAW_PROMPT)
+        assert output.extra_fields["search_r1_hit"] == 0
+        assert output.extra_fields["search_r1_first_hit_turn"] == -1
+
+    async def test_hit_uses_case_insensitive_alias_matching(self):
+        tool = FakeSearchTool(text="Doc: PARIS is the capital.")
+        turns = [
+            "<think>search</think><search> q </search>",
+            "<think>answer</think><answer> Paris </answer>",
+        ]
+        server = FakeLLMServer(self.tokenizer, turns)
+        loop = _make_loop(self.tokenizer, server, tool)
+
+        output = await loop.run(
+            {"logprobs": False},
+            raw_prompt=RAW_PROMPT,
+            reward_model={"ground_truth": {"target": ["  Paris  "]}},
+        )
+        assert output.extra_fields["search_r1_hit"] == 1
+        assert output.extra_fields["search_r1_first_hit_turn"] == 1
 
     async def test_no_tag_stops_without_search(self):
         server = FakeLLMServer(self.tokenizer, ["<think>I am not sure, no tag at all"])
@@ -383,6 +493,9 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
             "search_r1_end_reason": "turn_cap",
             "search_r1_num_searches": 2,
             "search_r1_queries": ["first", "second"],
+            "search_r1_hit": 1,
+            "search_r1_first_hit_turn": 2,
+            "search_r1_has_answer": 0,
         }
         result = search_r1_like_qa_em.compute_score(
             solution_str="<answer> Paris </answer>",
@@ -397,6 +510,9 @@ class TestSearchR1AgentLoop(unittest.IsolatedAsyncioTestCase):
         assert result["search_r1_end_answer"] == 0.0
         assert result["search_r1_num_searches"] == 2
         assert result["search_r1_queries"] == ["first", "second"]
+        assert result["search_r1_hit"] == 1
+        assert result["search_r1_first_hit_turn"] == 2
+        assert result["search_r1_has_answer"] == 0
 
         # Without agent-loop diagnostics the reward keeps its scalar contract.
         assert (

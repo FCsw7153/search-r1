@@ -252,6 +252,110 @@ reward 返回的 dict 里另有 4 个 0/1 字段 `search_r1_end_{answer,turn_cap
   trajectory 都接近长度上限时约 6–7 GB。放 pod 本地盘（`/home/work/rollouts/...`，pod
   重建即清空），不要放共享盘。
 
+## 对照基线：Stratified GRPO 与 GCA
+
+两个新的 advantage estimator 都注册在 `verl/trainer/ppo/core_algos.py`，只通过
+`algorithm.adv_estimator` 切换；其余配置与上面的 Qwen3-4B-Base baseline 完全相同，因此
+对照实验只差 estimator。
+
+### Stratified GRPO（`arXiv 2510.06214`）
+
+按每条 trajectory 的 `search_r1_num_searches` 在 **同一个 prompt group 内**分层，
+层内做 mean/std 归一化（SAN），再与整组的 GRPO advantage 线性混合：
+
+```
+A_blend = alpha * A_SAN + (1 - alpha) * A_GN
+```
+
+- `alpha=0` 严格等于原 GRPO；论文 Qwen2.5-3B **Base** 用 `0.6`（Instruct 用 `0.8`）。
+- 单元素/零方差层没有特殊 fallback：SAN=0，混合后退化为 `(1-alpha)*A_GN`。
+- 论文 Algorithm 1 用 population std；这里默认 `stratified_grpo_population_std=false`
+  （沿用 verl GRPO 的 sample std，使“所有轨迹同一层”时严格等于 GRPO）。要完全按论文
+  公式，设为 `true`。
+- `epsilon` 论文未给数值，默认沿用 GRPO 的 `1e-6`。
+
+在 baseline 命令末尾加：
+
+```bash
+  algorithm.adv_estimator=stratified_grpo \
+  algorithm.stratified_grpo_alpha=0.6
+```
+
+启动例子（其他 overrides 与上面的 baseline 相同）：
+
+```bash
+EXP=qwen3-4b-base-sr1-strat VAL=sub GPUS=0 BG=1 \
+MODEL_PATH="$SEARCH_R1_HOME/data/models/Qwen3-4B-Base" \
+bash verl/examples/search_r1/run_qwen3_5_2b_search_r1_grpo.sh \
+  actor_rollout_ref.rollout.agent.default_agent_loop=search_r1_agent \
+  actor_rollout_ref.model.use_remove_padding=True \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
+  actor_rollout_ref.rollout.enable_prefix_caching=True \
+  data.train_batch_size=128 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+  actor_rollout_ref.rollout.multi_turn.max_assistant_turns=5 \
+  actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable \
+  trainer.total_training_steps=800 \
+  trainer.rollout_data_dir=/home/work/rollouts/qwen3-4b-base-sr1-strat/train \
+  trainer.validation_data_dir=/home/work/rollouts/qwen3-4b-base-sr1-strat/val \
+  algorithm.adv_estimator=stratified_grpo \
+  algorithm.stratified_grpo_alpha=0.6
+```
+
+### GCA（`arXiv 2610.23148`）
+
+每条 trajectory 有两个可验证子结果：`H`（任一检索结果包含 gold alias，agent loop 里用
+大小写不敏感的 substring 判断）和 `C`（EM 正确）。按 `H/C` 把轨迹分成 A/B1/B2/C/D，再按
+`response_mask` 的连续 1-run 切成 vSearch / rSearch / Ans 三段，用论文 Table 1/9 的
+`P × lambda` 表对 GRPO advantage 做逐 token 修正。修正是 `eta=0.2, c_max=0.5`，并硬性
+clamp 在 `|A|` 的 10% 内，因此不会翻转 advantage 符号。
+
+在 baseline 命令末尾加：
+
+```bash
+  algorithm.adv_estimator=gca
+```
+
+默认值即论文值（`algorithm.gca_*`）：`eta=0.2, c_max=0.5, correction_cap=0.1,
+temperature=0.5, top_k=3, top_m=32, (alpha,beta,gamma)=(0.6,0.3,0.1)`。
+
+论文里有两处依赖 verl 当前拿不到的信息，这里做了显式取舍：
+
+- **`Retr(x)`**：论文用 gold alias 构造 oracle query 判断“可检索”，我们只有“本组是否有
+  rollout 命中”。默认 `gca_assume_retrievable=true`，即无命中的 correct 轨迹按 D1 处理；
+  设 `false` 则按 D0 把 advantage 置 0（KL loss 无法在这里 mask）。
+- **token salience**：论文的 `delta_t` 需要 top-K 竞争 token 的 logprob，`Hhat_t` 需要
+  top-M 分布；advantage 路径只有 sampled-token logprob 和 actor entropy。默认
+  `gca_salience_mode=approx` 用
+  `delta_t ~= log pi_old(y_t) + log K`、`Hhat_t ~= entropy_t / log M` 近似，再套论文
+  Eq. (5)-(6)。`constant` 则直接用 `c=c_max`（仍满足 10% cap）。
+- 论文排除 8 个结构 tag literal；advantage 路径没有 tokenizer，未做这一步排除，cap 和
+  不翻转符号的保证不受影响。
+- `C_i` 用 `reward > 0` 作为 EM 标志（Search-R1 的 reward 是 1.0，过度输出 answer tag 时
+  为 0.25）。GCA 假设 outcome-only reward；baseline 的 KL 在 loss 里
+  （`algorithm.use_kl_in_reward=false`），不要把 KL 加进 reward，否则 `C` 和
+  `std(R)` 都会被污染。
+
+### 新增诊断
+
+`search_r1_agent` 现在为每条 trajectory 额外写：
+
+| extra_fields | 含义 |
+| --- | --- |
+| `search_r1_hit` | 任一 retrieval 命中 gold alias（0/1） |
+| `search_r1_first_hit_turn` | 第一次命中的 search 轮次（1-based；无命中为 -1） |
+| `search_r1_has_answer` | 是否以合法 `</answer>` 结束（0/1） |
+
+它们和原有 `search_r1_*` 一样进入 `reward_extra_info`，所以 **plain GRPO 也会**在
+`training/reward_extra/...`、验证的 `val-aux/...` 和 rollout dump 里看到它们。
+`H` 在模型实际看到的、经 `max_tool_response_length` 截断后的 retrieval 文本上计算
+（论文用的是完整 tool response，命中若落在截断之外会漏掉）。
+
+两个 estimator 还会写自己的 step 级指标：
+
+- `training/adv_estimator/stratified_grpo/{alpha,num_strata,mean_stratum_size,singleton_strata_frac,zero_san_traj_frac}`
+- `training/adv_estimator/gca/{type_a_frac,...,type_d0_frac,corrected_traj_frac,skipped_zero_var_frac,mean_abs_correction,mean_abs_correction_ratio,mean_salience}`
+
 ## Checkpoint 放本地盘：CKPT_ROOT
 
 checkpoint 是 FSDP 模型 + fp32 optimizer，每个 25GB（4 rank），写共享盘很慢。设置

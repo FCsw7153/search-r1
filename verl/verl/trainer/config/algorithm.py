@@ -729,6 +729,23 @@ class AlgoConfig(BaseConfig):
 
             For backward compatibility, you can still pass a dict, which will be converted to
             RolloutCorrectionConfig automatically.
+        stratified_grpo_alpha (float): SAN/global blend for ``adv_estimator=stratified_grpo``
+            (paper default 0.6 for a base model).
+        stratified_grpo_epsilon (float): Numerical stabilizer for the stratum std.
+        stratified_grpo_population_std (bool): Use population instead of sample std inside SAN.
+        gca_eta (float): GCA correction strength (paper default 0.2).
+        gca_lambda_max (float): Maximum GCA routing magnitude.
+        gca_c_max (float): Maximum token salience (paper default 0.5).
+        gca_correction_cap (float): Hard per-token correction cap as a fraction of |advantage|
+            (0.1 at the paper's defaults).
+        gca_temperature (float): Temperature for the GCA token-salience sigmoid.
+        gca_top_k (int): K in GCA's sampled-token margin approximation.
+        gca_top_m (int): M in GCA's entropy normalization approximation.
+        gca_alpha (float): GCA salience weight on the margin term.
+        gca_beta (float): GCA salience weight on the entropy term.
+        gca_gamma (float): GCA salience weight on the margin-entropy interaction.
+        gca_salience_mode (str): ``approx`` (default) or ``constant`` (``c = c_max``).
+        gca_assume_retrievable (bool): Treat no-hit correct rollouts as D1 unless disabled.
     """
 
     gamma: float = 1.0
@@ -750,3 +767,20 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    # Stratified GRPO (arXiv 2510.06214): SAN blended with the prompt-group GRPO advantage.
+    stratified_grpo_alpha: float = 0.6
+    stratified_grpo_epsilon: float = 1e-6
+    stratified_grpo_population_std: bool = False
+    # GCA (arXiv 2610.23148): grounded credit assignment over search/answer segments.
+    gca_eta: float = 0.2
+    gca_lambda_max: float = 1.0
+    gca_c_max: float = 0.5
+    gca_correction_cap: float = 0.1
+    gca_temperature: float = 0.5
+    gca_top_k: int = 3
+    gca_top_m: int = 32
+    gca_alpha: float = 0.6
+    gca_beta: float = 0.3
+    gca_gamma: float = 0.1
+    gca_salience_mode: str = "approx"
+    gca_assume_retrievable: bool = True

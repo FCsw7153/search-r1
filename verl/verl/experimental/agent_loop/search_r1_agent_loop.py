@@ -109,6 +109,38 @@ def parse_search_r1_action(text: str) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def extract_gold_answers(reward_model: Any) -> list[str]:
+    """Return the non-empty gold answer aliases from a dataset row's ``reward_model``.
+
+    The Search-R1 parquet stores ``reward_model = {"style": "rule", "ground_truth":
+    {"target": [...]}}``. The agent loop receives the same dict through ``kwargs``; returning an
+    empty list means the aliases are unavailable and the hit diagnostics stay at their defaults.
+    """
+    if not isinstance(reward_model, dict):
+        return []
+    ground_truth = reward_model.get("ground_truth")
+    if isinstance(ground_truth, dict):
+        targets = ground_truth.get("target")
+    else:
+        targets = ground_truth
+    if isinstance(targets, str):
+        targets = [targets]
+    if not isinstance(targets, (list, tuple)):
+        return []
+    return [str(target) for target in targets if target is not None and str(target).strip()]
+
+
+def response_contains_gold_alias(text: str, gold_answers: list[str]) -> bool:
+    """Paper-style evidence-hit test: ``lower(strip(alias)) in lower(response)``.
+
+    This is the ``m(a, o)`` containment test from GCA (arXiv 2610.23148, Eq. 1). It is
+    deliberately a raw case-insensitive substring test rather than the EM normalizer: aliases
+    are already short answer strings, and normalization would make short aliases over-match.
+    """
+    lowered = text.lower()
+    return any(alias.strip().lower() in lowered for alias in gold_answers if alias.strip())
+
+
 def truncate_tool_response(text: str, max_length: Optional[int], truncate_side: str) -> str:
     """Truncate a tool response by characters, matching ToolAgentLoop's behaviour."""
     if not text or not max_length or len(text) <= max_length:
@@ -153,6 +185,7 @@ class SearchR1AgentLoop(AgentLoopBase):
         priority = int(priority)
 
         question = extract_question(list(kwargs["raw_prompt"]))
+        gold_answers = extract_gold_answers(kwargs.get("reward_model"))
         prompt_ids = await self.loop.run_in_executor(None, self._build_prompt_ids, question)
         prompt_ids = self._cap_text_prompt_length(prompt_ids)
 
@@ -167,6 +200,8 @@ class SearchR1AgentLoop(AgentLoopBase):
         assistant_turns = 0
         user_turns = 0
         search_queries: list[str] = []
+        hit = 0
+        first_hit_turn = -1
         end_reason = "no_action"
 
         while True:
@@ -236,6 +271,11 @@ class SearchR1AgentLoop(AgentLoopBase):
             with simple_timer("tool_calls", metrics):
                 documents = await self._search(query)
             search_queries.append(query)
+            # Record the first search turn whose (truncated) retrieved text contains a gold alias.
+            # This is GCA's H_i / k_i^* (arXiv 2610.23148, Eq. 1) and is also a plain-GRPO diagnostic.
+            if not hit and gold_answers and response_contains_gold_alias(documents, gold_answers):
+                hit = 1
+                first_hit_turn = len(search_queries)
             observation = f"\n\n<information>{documents}</information>\n\n"
             observation_ids = await self.loop.run_in_executor(
                 None, lambda text=observation: self.tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -255,6 +295,9 @@ class SearchR1AgentLoop(AgentLoopBase):
                 "search_r1_end_reason": end_reason,
                 "search_r1_num_searches": len(search_queries),
                 "search_r1_queries": search_queries,
+                "search_r1_hit": hit,
+                "search_r1_first_hit_turn": first_hit_turn,
+                "search_r1_has_answer": int(end_reason == "answer"),
             }
         )
 
