@@ -252,6 +252,82 @@ reward 返回的 dict 里另有 4 个 0/1 字段 `search_r1_end_{answer,turn_cap
   trajectory 都接近长度上限时约 6–7 GB。放 pod 本地盘（`/home/work/rollouts/...`，pod
   重建即清空），不要放共享盘。
 
+## 单卡 pod（全本地盘）
+
+单卡 B300 pod 用两个脚本，全部落在容器本地盘，**不往共享盘 `/home/work/mshop-agent-1`
+写**（那块 spfs FUSE 盘在负载下挂死过，会拖住所有 job）：
+
+```bash
+# 1) 新 pod 上准备：clone 代码、stage venv/检索数据、装 swanlab、下载模型、启动检索服务。
+#    必须在持久终端（Herdr / hc run --bg）里前台运行：脚本最后用 tail --pid 持有检索服务。
+bash /home/work/sr1/verl/examples/search_r1/pod_setup_local.sh
+
+# 2) 另一个终端：Qwen3-8B-Base，KL-Cov，过滤后的数据，300 步
+cd /home/work/sr1
+TRAIN_FILE=/home/work/search_r1_local/data/search_r1_filtered/train.parquet \
+bash verl/examples/search_r1/run_qwen3_base_local.sh qwen3-8b-klcov 0 \
+    actor_rollout_ref.actor.policy_loss.loss_mode=kl_cov
+```
+
+`pod_setup_local.sh` 是幂等的：`/home/work/sr1` 已存在就 `fetch + merge --ff-only` 到
+`verl-rebase`（有本地修改会明确报错而不是覆盖）；`stage_local.sh` 从共享盘拷 venv 和检索
+数据到 `/home/work/search_r1_local`，然后把 venv 里 `__editable__.verl-*.pth` 改成
+`/home/work/sr1/verl`；HF 模型下到
+`/home/work/search_r1_local/data/models/<MODEL_REPO 的最后一段>`（默认
+`Qwen/Qwen3-8B-Base`），并把 `generation_config.json` 的 `eos_token_id` 设为
+`[151645, 151643]`；`data/search_r1` 总会拷，`data/search_r1_filtered` 缺失时跳过（它不在
+共享盘上，是本地产物）。可用 `MODEL_REPO=`、`SHARED_ROOT=`、`RETRIEVER_GPU=` 覆盖默认值。
+
+`run_qwen3_base_local.sh <EXP> <GPU> [hydra overrides...]` 固定了单卡 base 协议的一整套
+override（`search_r1_agent`、`max_assistant_turns=5`、关闭 tokenization sanity check、
+rmpad、`ppo_max_token_len_per_gpu=24576`、prefix caching 关、batch 128 / mini 64、
+`rollout_is=null`、`save_freq=-1`、`FLASH_ATTN`、rollout/validation dump，SwanLab 在
+`~/.swanlab_key` 存在时启用，项目名 `search_r1_qwen3`）。常用环境变量：
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `MODEL_NAME` | `Qwen3-8B-Base` | `data/models/` 下的目录名 |
+| `TRAIN_FILE` | `.../search_r1/train.parquet` | 训练 parquet |
+| `TEST_FILE` | `.../search_r1/test_sub.parquet` | 验证 parquet |
+| `STEPS` / `TEST_FREQ` | `300` / `50` | 总步数 / 验证间隔（`-1` 关闭） |
+| `GPU_MEM` | `0.6` | vLLM `gpu_memory_utilization` |
+| `REF_OFFLOAD` / `OPT_OFFLOAD` | `0` / `0` | 1 = ref 参数 / actor optimizer offload 到 CPU |
+| `DISK_LIMIT_GB` | `180` | 可写盘上限，超过就 SIGTERM 本实验 |
+| `RESUME` / `MAX_RETRIES` | `0` / `2` | 首次是否续训 / 非信号失败最多重试次数 |
+| `DRY_RUN` | `0` | 只打印最终 override 列表，不建目录不启动 |
+
+后台 watchdog（退出时一起 kill）：
+
+- **hang**：`experiments/<EXP>/runs/*.metrics.jsonl` 超过 15 分钟没更新时，把 `nvidia-smi`
+  和 `/proc/<pid>/environ` 里带本实验 `CUDA_VISIBLE_DEVICES` 的 python/Ray/vLLM 进程的
+  `py-spy dump`（**不要 sudo**：root 没有 `CAP_SYS_PTRACE`）写到
+  `/home/work/rollouts/<EXP>/hang/<UTC>.txt`，30 分钟内不重复抓。
+- **disk**：每 5 分钟用 `du -sx -k` 量 `/home/work`（`-x`/`--exclude` 跳过共享挂载）加
+  `/tmp`，记到 `rollouts/<EXP>/watchdog.log`；超过 `DISK_LIMIT_GB` 时先原子写
+  `rollouts/<EXP>/DISK_LIMIT_EXCEEDED.txt`，再向本实验进程组发 SIGTERM，让训练干净停止，
+  避免整个容器被平台驱逐。启动前也会同步查一次。
+- **重试**：launcher 非信号失败最多重试 2 次（`MAX_RETRIES`）；`save_freq=-1` 没有
+  checkpoint，所以每次重试都**从第 0 步开始**（脚本会打印提醒）。信号退出和磁盘超限不重试。
+
+### 8B 单卡显存（需冒烟验证）
+
+B300 单卡约 275 GB，GPU0 上的检索服务约占 34 GB。8B 模型 FSDP 不切分时
+fp32 参数 + Adam 约 `16 B/param ≈ 130 GB`，bf16 ref 约 16 GB，bf16 梯度约 16 GB。
+`GPU_MEM=0.6` 给 vLLM 约 165 GB，只剩 ~110 GB，再扣检索服务就放不下训练状态；单卡 8B
+建议先用 `GPU_MEM=0.25~0.35`（约 70–96 GB 给 vLLM），显存仍紧再加 `REF_OFFLOAD=1`
+（ref 空闲时挪到 CPU，省 ~16 GB），最后才考虑 `OPT_OFFLOAD=1`（省 ~64 GB Adam，但每步
+变慢）。这些数字只是估算，**必须**先用一次性 EXP 跑 2 步确认：
+
+```bash
+cd /home/work/sr1
+STEPS=2 TEST_FREQ=-1 GPU_MEM=0.3 REF_OFFLOAD=1 \
+bash verl/examples/search_r1/run_qwen3_base_local.sh smoke-8b 0 \
+    trainer.val_before_train=False
+```
+
+确认显存峰值（`nvidia-smi` 和日志里的 FSDP 峰值）后再开 300 步长跑；正式 EXP 不要复用
+冒烟的名字。
+
 ## 对照基线：Stratified GRPO 与 GCA
 
 两个新的 advantage estimator 都注册在 `verl/trainer/ppo/core_algos.py`，只通过

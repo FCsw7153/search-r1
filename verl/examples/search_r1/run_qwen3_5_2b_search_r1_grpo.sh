@@ -472,6 +472,7 @@ import datetime
 import json
 import os
 import sys
+import tempfile
 
 path = os.environ["META_FILE"]
 now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -509,9 +510,23 @@ for index, item in enumerate(launches):
 else:
     launches.append(launch)
 
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(meta, handle, indent=2, ensure_ascii=False)
-    handle.write("\n")
+# 原子写：SIGTERM 落在 json.dump 中间时，meta.json 不能变成 0 字节或半截 JSON。
+# 同目录临时文件 + fsync + os.replace；读 meta 的一方要么看到旧文件，要么看到新文件。
+directory = os.path.dirname(path) or "."
+# 保留原文件权限（首次创建时用 0644，和普通 open() 一致）；mkstemp 默认是 0600。
+mode = (os.stat(path).st_mode & 0o777) if os.path.exists(path) else 0o644
+fd, tmp_path = tempfile.mkstemp(prefix=".meta.", suffix=".tmp", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
+finally:
+    if os.path.exists(tmp_path):
+        os.unlink(tmp_path)
 PY
 }
 
